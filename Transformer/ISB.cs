@@ -5,7 +5,7 @@ using System.Text;
 
 namespace IpfbTool.Core
 {
-    internal sealed class ISB : ITransformer
+    internal sealed class ISBU : ITransformer
     {
         const uint MARKER_NUMBER = 0x40403;
         const uint MARKER_TEXT = 0x40400;
