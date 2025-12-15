@@ -101,7 +101,7 @@ namespace IpfbTool.Core
                 {
                     byte[] imgData = Array.Empty<byte>();
 
-                    if (e.IsExternal == 0 && e.ImgId != 0 && texById.TryGetValue(e.ImgId, out var texEntry))
+                    if (e.ImgId != 0 && texById.TryGetValue(e.ImgId, out var texEntry))
                         imgData = BuildTexture(texEntry, rootDir);
 
                     ms.WriteByte((byte)(e.CharCode >> 8));

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -20,36 +21,64 @@ namespace IpfbTool.Archive
             var managedPngFull = BuildManagedPngSet(inputDir, manifest);
             var builtRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            var processed = new ConcurrentDictionary<uint, byte[]>();
+            // 先做必须串行的“构建类产物”
+            var fixedOutputs = new List<(uint hash, byte[] data)>(capacity: 1024);
 
-            BuildStandaloneTextures(manifest, inputDir, processed, builtRel);
+            BuildStandaloneTextures(manifest, inputDir, fixedOutputs, builtRel);
 
             foreach (var kv in FNT.BuildAll(manifest, inputDir, texById))
             {
                 uint hash = FileId.FromPath(kv.Key);
-                processed[hash] = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
+                byte[] data = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
+                fixedOutputs.Add((hash, data));
                 builtRel.Add(NormRel(kv.Key));
             }
 
             foreach (var kv in PRT.BuildAll(manifest, inputDir, texById))
             {
                 uint hash = FileId.FromPath(kv.Key);
-                processed[hash] = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
+                byte[] data = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
+                fixedOutputs.Add((hash, data));
                 builtRel.Add(NormRel(kv.Key));
             }
 
+            // 收集需要走插件/原始打包的文件
             var files = CollectFiles(inputDir, managedPngFull, builtRel);
 
-            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, rel =>
-            {
-                string fullPath = Path.Combine(inputDir, rel);
-                var (packedName, packedData) = Transformers.ProcessPack(rel, fullPath);
-                uint hash = FileId.FromPath(packedName);
-                byte[] chunk = ShouldCompress(packedName) ? CompressCustomBytes(packedData) : packedData;
-                processed[hash] = chunk;
-            });
+            // 并行处理文件：用线程本地 list 收集，最后合并，避免 ConcurrentDictionary 热点
+            var bag = new ConcurrentBag<List<(uint hash, byte[] data)>>();
 
-            WritePak(processed, pakPath);
+            int dop = Math.Clamp(Environment.ProcessorCount, 1, 12);
+            Parallel.ForEach(
+                files,
+                new ParallelOptions { MaxDegreeOfParallelism = dop },
+                () => new List<(uint, byte[])>(capacity: 64),
+                (rel, _, local) =>
+                {
+                    string fullPath = Path.Combine(inputDir, rel);
+
+                    var (packedName, packedData) = Transformers.ProcessPack(rel, fullPath);
+
+                    uint hash = FileId.FromPath(packedName);
+                    byte[] chunk = ShouldCompress(packedName) ? CompressCustomBytes(packedData) : packedData;
+
+                    local.Add((hash, chunk));
+                    return local;
+                },
+                local => bag.Add(local)
+            );
+
+            // 合并所有输出
+            var all = new List<(uint hash, byte[] data)>(fixedOutputs.Count + files.Count);
+            all.AddRange(fixedOutputs);
+            foreach (var local in bag) all.AddRange(local);
+
+            // 去重：同 hash 后写覆盖前写（行为与 ConcurrentDictionary 最接近）
+            // 若你希望“重复视为错误”，这里也可以改成 throw
+            var map = new Dictionary<uint, byte[]>(all.Count);
+            foreach (var (hash, data) in all) map[hash] = data;
+
+            WritePak(map, pakPath);
         }
 
         static Dictionary<uint, Dictionary<string, string>> BuildTexIndexById(Manifest manifest)
@@ -74,7 +103,11 @@ namespace IpfbTool.Archive
             return set;
         }
 
-        static void BuildStandaloneTextures(Manifest manifest, string rootDir, ConcurrentDictionary<uint, byte[]> processed, HashSet<string> builtRel)
+        static void BuildStandaloneTextures(
+            Manifest manifest,
+            string rootDir,
+            List<(uint hash, byte[] data)> outputs,
+            HashSet<string> builtRel)
         {
             foreach (var t in manifest.T32)
             {
@@ -85,8 +118,8 @@ namespace IpfbTool.Archive
 
                 byte[] data = BuildTextureBytes(t, rootDir);
                 uint hash = FileId.FromPath(name);
-                processed[hash] = ShouldCompress(name) ? CompressCustomBytes(data) : data;
 
+                outputs.Add((hash, ShouldCompress(name) ? CompressCustomBytes(data) : data));
                 builtRel.Add(NormRel(name));
             }
         }
@@ -133,41 +166,45 @@ namespace IpfbTool.Archive
             return true;
         }
 
-        static void WritePak(ConcurrentDictionary<uint, byte[]> processed, string pakPath)
+        static void WritePak(Dictionary<uint, byte[]> processed, string pakPath)
         {
-            var sortedHashes = processed.Keys.OrderBy(h => h).ToList();
+            var sorted = processed.Keys.OrderBy(h => h).ToList();
+
             string pakDir = Path.GetDirectoryName(pakPath) ?? "";
             string baseName = Path.GetFileNameWithoutExtension(pakPath);
             string p00Path = Path.Combine(pakDir, $"{baseName}.p00");
 
-            var entries = new List<Entry>(sortedHashes.Count);
-            byte[] padBuffer = new byte[2048];
+            var entries = new List<Entry>(sorted.Count);
 
-            using (var p00 = new FileStream(p00Path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+            // 写 p00：顺序写 + 一次性写 padding
+            using (var p00 = new FileStream(p00Path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan))
             {
-                for (int i = 0; i < sortedHashes.Count; i++)
+                for (int i = 0; i < sorted.Count; i++)
                 {
-                    uint hash = sortedHashes[i];
+                    uint hash = sorted[i];
                     byte[] chunk = processed[hash];
 
-                    entries.Add(new Entry { Hash = hash, Offset = (int)p00.Position, Size = chunk.Length });
-                    p00.Write(chunk);
+                    int offset = checked((int)p00.Position);
+                    entries.Add(new Entry { Hash = hash, Offset = offset, Size = chunk.Length });
 
-                    if (i < sortedHashes.Count - 1)
+                    p00.Write(chunk, 0, chunk.Length);
+
+                    if (i < sorted.Count - 1)
                     {
-                        long pad = (2048 - p00.Position % 2048) % 2048;
-                        while (pad > 0)
+                        int pad = (int)((2048 - (p00.Position & 2047)) & 2047);
+                        if (pad != 0)
                         {
-                            int c = (int)Math.Min(pad, 2048);
-                            p00.Write(padBuffer, 0, c);
-                            pad -= c;
+                            Span<byte> zeros = pad <= 4096 ? stackalloc byte[pad] : new byte[pad];
+                            zeros.Clear();
+                            p00.Write(zeros);
                         }
                     }
                 }
             }
 
-            using var pakFs = new FileStream(pakPath, FileMode.Create, FileAccess.Write, FileShare.None);
-            using var bw = new BinaryWriter(pakFs, Encoding.ASCII, true);
+            // 写 pak 头与索引
+            using var pakFs = new FileStream(pakPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
+            using var bw = new BinaryWriter(pakFs, Encoding.ASCII, leaveOpen: true);
 
             bw.Write("IPFB"u8);
             BeBinary.WriteInt32(bw, entries.Count);
@@ -184,34 +221,46 @@ namespace IpfbTool.Archive
 
         static byte[] CompressCustomBytes(byte[] raw)
         {
-            using var compMs = new MemoryStream();
-            using (var ds = new DeflateStream(compMs, CompressionLevel.SmallestSize, true))
-                ds.Write(raw);
+            // Deflate 输出先到 MemoryStream，但避免 ToArray 的额外拷贝：TryGetBuffer + 精确复制
+            using var compMs = new MemoryStream(raw.Length / 2);
+            using (var ds = new DeflateStream(compMs, CompressionLevel.SmallestSize, leaveOpen: true))
+            {
+                ds.Write(raw, 0, raw.Length);
+            }
 
-            byte[] comp = compMs.ToArray();
+            if (!compMs.TryGetBuffer(out ArraySegment<byte> seg))
+                seg = new ArraySegment<byte>(compMs.ToArray());
+
+            int compLen = (int)compMs.Length;
+
             uint len = (uint)raw.Length;
             uint adler = Adler32(raw);
 
-            byte[] result = new byte[12 + comp.Length + 4];
+            int outLen = 12 + compLen + 4;
+            byte[] result = GC.AllocateUninitializedArray<byte>(outLen);
+
             result[0] = (byte)'Z'; result[1] = (byte)'1';
             result[2] = (byte)(len >> 24); result[3] = (byte)(len >> 16);
             result[4] = (byte)(len >> 8); result[5] = (byte)len;
             result[6] = (byte)(adler >> 24); result[7] = (byte)(adler >> 16);
             result[8] = (byte)(adler >> 8); result[9] = (byte)adler;
             result[10] = 0x78; result[11] = 0xDA;
-            Buffer.BlockCopy(comp, 0, result, 12, comp.Length);
-            int p = 12 + comp.Length;
+
+            Buffer.BlockCopy(seg.Array!, seg.Offset, result, 12, compLen);
+
+            int p = 12 + compLen;
             result[p] = (byte)(adler >> 24); result[p + 1] = (byte)(adler >> 16);
             result[p + 2] = (byte)(adler >> 8); result[p + 3] = (byte)adler;
+
             return result;
         }
 
         static uint Adler32(byte[] data)
         {
             uint a = 1, b = 0;
-            foreach (byte t in data)
+            for (int i = 0; i < data.Length; i++)
             {
-                a = (a + t) % 65521;
+                a = (a + data[i]) % 65521;
                 b = (b + a) % 65521;
             }
             return (b << 16) | a;
@@ -222,6 +271,10 @@ namespace IpfbTool.Archive
 
         static string NormRel(string rel) => rel.Replace('\\', '/');
 
-        sealed class Entry { public uint Hash; public int Offset, Size; }
+        sealed class Entry
+        {
+            public uint Hash;
+            public int Offset, Size;
+        }
     }
 }
