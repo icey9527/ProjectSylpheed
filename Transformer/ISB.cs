@@ -432,7 +432,7 @@ namespace IpfbTool.Core
             {
                 WriteU32(block, P_WSTR);
                 string s = Unescape(token.Substring(2, token.Length - 3));
-                WriteEncBytes(block, Encoding.Unicode.GetBytes(s), key);
+                WriteEncBytes(block, Encoding.Unicode.GetBytes(s), key); // UTF-16LE
                 return;
             }
 
