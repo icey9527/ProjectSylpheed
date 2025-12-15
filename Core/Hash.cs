@@ -63,5 +63,25 @@ namespace IpfbTool.Core
             hash %= 0xFFFFDF;
             return unchecked((int)((((uint)sum & 0xFF) << 24) | (uint)hash));
         }
+
+        public static uint MakeStrID(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+
+            var bytes = CP932.GetBytes(s);
+
+            uint v2 = 0;
+            uint v3 = 0;
+
+            foreach (byte b in bytes)
+            {
+                v3 = unchecked(v3 + b);
+                v2 = unchecked((v2 << 8) + b);
+                v2 %= 0xFFF9D7u;
+            }
+
+            return unchecked(((v3 & 0xFFu) << 24) | v2);
+        }
+
     }
 }

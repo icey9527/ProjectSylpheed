@@ -63,8 +63,6 @@ namespace IpfbTool
                     Console.WriteLine("输入目录不存在: " + inDir);
                     return 1;
                 }
-
-                Transformers.PreloadForPack(inDir);
                 IpfbPack.Pack(inDir, pakPath);
                 return 0;
             }

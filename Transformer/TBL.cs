@@ -5,191 +5,255 @@ using System.Text;
 
 namespace IpfbTool.Core
 {
-    internal sealed class TBL : ITransformer
+    internal sealed class TBLR : ITransformer
     {
-        public bool CanTransformOnExtract(string name)
+        static TBLR()
         {
-            string ext = Path.GetExtension(name);
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        }
+
+        static readonly Encoding CP932 = Encoding.GetEncoding(932);
+        static readonly Encoding UTF16BE = Encoding.BigEndianUnicode;
+
+        static bool IsTarget(string name)
+        {
+            var ext = Path.GetExtension(name);
             return ext.Equals(".tbl", StringComparison.OrdinalIgnoreCase)
                 || ext.Equals(".IDXD", StringComparison.OrdinalIgnoreCase)
                 || ext.Equals(".IXUD", StringComparison.OrdinalIgnoreCase);
         }
 
-        public (string name, byte[] data) OnExtract(byte[] srcData, string srcName)
+        public bool CanTransformOnExtract(string name) => IsTarget(name);
+
+        public (string name, byte[] data) OnExtract(byte[] srcData, string srcName, Manifest manifest)
         {
+            if (srcData.Length < 8) return (srcName, srcData);
+
+            var header = srcData.AsSpan(0, 4);
+            bool isIdxd = header.SequenceEqual("IDXD"u8);
+            bool isIxud = header.SequenceEqual("IXUD"u8);
+            if (!isIdxd && !isIxud) return (srcName, srcData);
+
+            bool isUtf16 = isIxud;
+            var enc = isUtf16 ? UTF16BE : CP932;
+            int ptrMul = isUtf16 ? 2 : 1;
+
             using var ms = new MemoryStream(srcData, false);
             using var br = new BinaryReader(ms);
 
-            byte[] header = br.ReadBytes(4);
-            bool isUtf16 = header.AsSpan().SequenceEqual("IXUD"u8);
-            int ptrMul = isUtf16 ? 2 : 1;
+            ms.Position = 4;
 
-            int idx1Count = ReadBE(br);
-            var idx1 = new List<(int hash, int ptr, int p1, int p2)>(idx1Count);
-            for (int i = 0; i < idx1Count; i++)
-                idx1.Add((ReadBE(br), ReadBE(br), ReadBE(br), ReadBE(br)));
+            int sectionCount = BeBinary.ReadInt32(br);
+            var sections = new (int namePtr, int startIdx, int endIdx)[sectionCount];
+            for (int i = 0; i < sectionCount; i++)
+            {
+                BeBinary.ReadInt32(br);
+                sections[i] = (BeBinary.ReadInt32(br), BeBinary.ReadInt32(br), BeBinary.ReadInt32(br));
+            }
 
-            int idx2Count = ReadBE(br);
-            var idx2 = new List<(int hash, int ptr1, int ptr2)>(idx2Count);
-            for (int i = 0; i < idx2Count; i++)
-                idx2.Add((ReadBE(br), ReadBE(br), ReadBE(br)));
+            int kvCount = BeBinary.ReadInt32(br);
+            var kvs = new (int key, int keyPtr, int valuePtr)[kvCount];
+            for (int i = 0; i < kvCount; i++)
+                kvs[i] = (BeBinary.ReadInt32(br), BeBinary.ReadInt32(br), BeBinary.ReadInt32(br));
 
-            ReadBE(br);
-            long strStart = ms.Position;
+            BeBinary.ReadInt32(br);
+            long strBase = ms.Position;
+
+            string GetStr(int ptr) => ptr < 0 ? "" : ReadString(ms, strBase + (long)ptr * ptrMul, enc, isUtf16);
 
             var sb = new StringBuilder();
-
-            foreach (var (hash, ptr, p1, p2) in idx1)
+            foreach (var (namePtr, startIdx, endIdx) in sections)
             {
-                string s = ptr != -1 ? ReadString(ms, strStart + (long)ptr * ptrMul, isUtf16) : "";
-                sb.AppendFormat("##{0:X8} {1:X8} {2:X8}\n", hash, p1, p2);
-                sb.AppendLine(s);
+                sb.Append('[').Append(GetStr(namePtr)).Append("]\r\n");
+
+                int end = endIdx < kvCount ? endIdx : kvCount;
+                for (int i = startIdx; i < end; i++)
+                {
+                    var (key, keyPtr, valuePtr) = kvs[i];
+                    var value = GetStr(valuePtr);
+
+                    if (keyPtr == -1)
+                        sb.Append('#').AppendFormat("{0:X8}", key).Append('=').Append(value).Append("\r\n");
+                    else
+                        sb.Append(GetStr(keyPtr)).Append('=').Append(value).Append("\r\n");
+                }
+
+                sb.Append("\r\n");
             }
 
-            foreach (var (hash, ptr1, ptr2) in idx2)
-            {
-                string s1 = ptr1 != -1 ? ReadString(ms, strStart + (long)ptr1 * ptrMul, isUtf16) : "";
-                string s2 = ptr2 != -1 ? ReadString(ms, strStart + (long)ptr2 * ptrMul, isUtf16) : "";
-                sb.AppendFormat("#{0:X8}\n", hash);
-                sb.AppendLine(s1);
-                sb.AppendLine(s2);
-            }
+            var text = sb.ToString();
+            if (!isUtf16) return (srcName, enc.GetBytes(text));
 
-            string ext = isUtf16 ? ".xdib" : ".xdi";
-            return (Path.ChangeExtension(srcName, ext), Encoding.UTF8.GetBytes(sb.ToString()));
+            var body = enc.GetBytes(text);
+            var result = new byte[2 + body.Length];
+            result[0] = 0xFE;
+            result[1] = 0xFF;
+            Buffer.BlockCopy(body, 0, result, 2, body.Length);
+            return (srcName, result);
         }
 
-        public bool CanTransformOnPack(string name)
-        {
-            string ext = Path.GetExtension(name);
-            return ext.Equals(".xdi", StringComparison.OrdinalIgnoreCase)
-                || ext.Equals(".xdib", StringComparison.OrdinalIgnoreCase);
-        }
+        public bool CanTransformOnPack(string name) => IsTarget(name);
 
         public (string name, byte[] data) OnPack(string srcPath, string srcName)
         {
-            bool isUtf16 = srcPath.EndsWith(".xdib", StringComparison.OrdinalIgnoreCase);
+            var raw = File.ReadAllBytes(srcPath);
 
-            var idx1 = new List<(int hash, int p1, int p2, string s)>();
-            var idx2 = new List<(int hash, string s1, string s2)>();
-
-            using (var sr = new StreamReader(srcPath, Encoding.UTF8))
+            if (raw.Length >= 4)
             {
+                var h = raw.AsSpan(0, 4);
+                if (h.SequenceEqual("IDXD"u8) || h.SequenceEqual("IXUD"u8))
+                    return (srcName, raw);
+            }
+
+            bool isUtf16 = raw.Length >= 2 && raw[0] == 0xFE && raw[1] == 0xFF;
+            var enc = isUtf16 ? UTF16BE : CP932;
+            int ptrMul = isUtf16 ? 2 : 1;
+
+            int HashOf(string s) => isUtf16 ? Hash.UTF16BEhash(s) : Hash.JIShash(s);
+
+            var sections = new List<(string name, int start, int end)>();
+            var kvs = new List<(int? numKey, string strKey, string value)>();
+
+            using (var ms = new MemoryStream(raw))
+            using (var sr = new StreamReader(ms, enc, true))
+            {
+                string section = null;
+                int start = 0;
+
                 string line;
                 while ((line = sr.ReadLine()) != null)
                 {
-                    line = line.Trim();
                     if (line.Length == 0) continue;
 
-                    if (line.StartsWith("##"))
+                    int cut = line.IndexOf("//", StringComparison.Ordinal);
+                    if (cut >= 0) line = line[..cut];
+                    cut = line.IndexOf(';');
+                    if (cut >= 0) line = line[..cut];
+
+                    if (line.Length == 0) continue;
+
+                    if (line[0] == '[' && line[^1] == ']')
                     {
-                        var p = line[2..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                        idx1.Add((
-                            Convert.ToInt32(p[0], 16),
-                            Convert.ToInt32(p[1], 16),
-                            Convert.ToInt32(p[2], 16),
-                            sr.ReadLine() ?? ""));
+                        if (section != null) sections.Add((section, start, kvs.Count));
+                        section = line[1..^1];
+                        start = kvs.Count;
+                        continue;
                     }
-                    else if (line.StartsWith("#"))
-                    {
-                        int hash = Convert.ToInt32(line[1..].Trim(), 16);
-                        idx2.Add((hash, sr.ReadLine() ?? "", sr.ReadLine() ?? ""));
-                    }
+
+                    int eq = line.IndexOf('=');
+                    if (eq < 0) continue;
+
+                    var keyPart = line[..eq];
+                    var valPart = line[(eq + 1)..];
+
+                    if (keyPart.Length > 0 && keyPart[0] == '#' && int.TryParse(keyPart[1..], System.Globalization.NumberStyles.HexNumber, null, out int numKey))
+                        kvs.Add((numKey, null, valPart));
+                    else
+                        kvs.Add((null, keyPart, valPart));
                 }
+
+                if (section != null) sections.Add((section, start, kvs.Count));
             }
 
-            using var strData = new MemoryStream();
-            var strOffsets = new Dictionary<string, int>();
+            using var strPool = new MemoryStream();
+            var strPtrs = new Dictionary<string, int>(StringComparer.Ordinal);
+            int emptyPtr = -1;
 
-            int AddStr(string s)
+            int AddString(string s)
             {
-                if (s.Length == 0) return -1;
-                if (strOffsets.TryGetValue(s, out int off)) return isUtf16 ? off / 2 : off;
-                off = (int)strData.Position;
-                byte[] enc = isUtf16
-                    ? Encoding.BigEndianUnicode.GetBytes(s + "\0")
-                    : Encoding.UTF8.GetBytes(s + "\0");
-                strData.Write(enc);
-                strOffsets[s] = off;
-                return isUtf16 ? off / 2 : off;
+                s ??= "";
+
+                if (s.Length == 0)
+                {
+                    if (emptyPtr >= 0) return emptyPtr;
+                    emptyPtr = checked((int)(strPool.Position / ptrMul));
+                    if (isUtf16) { strPool.WriteByte(0); strPool.WriteByte(0); }
+                    else strPool.WriteByte(0);
+                    strPtrs[""] = emptyPtr;
+                    return emptyPtr;
+                }
+
+                if (strPtrs.TryGetValue(s, out var p)) return p;
+
+                p = checked((int)(strPool.Position / ptrMul));
+                var bytes = enc.GetBytes(s);
+                strPool.Write(bytes, 0, bytes.Length);
+                if (isUtf16) { strPool.WriteByte(0); strPool.WriteByte(0); }
+                else strPool.WriteByte(0);
+                strPtrs[s] = p;
+                return p;
             }
 
-            var idx1Bin = idx1.ConvertAll(x => (x.hash, AddStr(x.s), x.p1, x.p2));
-            var idx2Bin = idx2.ConvertAll(x => (x.hash, AddStr(x.s1), AddStr(x.s2)));
+            var sectionsBin = new (int hash, int namePtr, int startIdx, int endIdx)[sections.Count];
+            for (int i = 0; i < sections.Count; i++)
+            {
+                var s = sections[i];
+                sectionsBin[i] = (HashOf(s.name), AddString(s.name), s.start, s.end);
+            }
 
-            int strSize = isUtf16 ? (int)strData.Length / 2 : (int)strData.Length;
+            var kvsBin = new (int key, int keyPtr, int valuePtr)[kvs.Count];
+            for (int i = 0; i < kvs.Count; i++)
+            {
+                var kv = kvs[i];
+                kvsBin[i] = kv.numKey.HasValue
+                    ? (kv.numKey.Value, -1, AddString(kv.value))
+                    : (HashOf(kv.strKey), AddString(kv.strKey), AddString(kv.value));
+            }
 
-            using var msOut = new MemoryStream();
-            using var bw = new BinaryWriter(msOut, Encoding.ASCII, true);
+            using var ms2 = new MemoryStream();
+            using var bw = new BinaryWriter(ms2);
 
             bw.Write(isUtf16 ? "IXUD"u8 : "IDXD"u8);
-            WriteBE(bw, idx1Bin.Count);
-            foreach (var (hash, ptr, p1, p2) in idx1Bin)
+
+            BeBinary.WriteInt32(bw, sectionsBin.Length);
+            foreach (var (hash, namePtr, startIdx, endIdx) in sectionsBin)
             {
-                WriteBE(bw, hash);
-                WriteBE(bw, ptr);
-                WriteBE(bw, p1);
-                WriteBE(bw, p2);
+                BeBinary.WriteInt32(bw, hash);
+                BeBinary.WriteInt32(bw, namePtr);
+                BeBinary.WriteInt32(bw, startIdx);
+                BeBinary.WriteInt32(bw, endIdx);
             }
 
-            WriteBE(bw, idx2Bin.Count);
-            foreach (var (hash, ptr1, ptr2) in idx2Bin)
+            BeBinary.WriteInt32(bw, kvsBin.Length);
+            foreach (var (key, keyPtr, valuePtr) in kvsBin)
             {
-                WriteBE(bw, hash);
-                WriteBE(bw, ptr1);
-                WriteBE(bw, ptr2);
+                BeBinary.WriteInt32(bw, key);
+                BeBinary.WriteInt32(bw, keyPtr);
+                BeBinary.WriteInt32(bw, valuePtr);
             }
 
-            WriteBE(bw, strSize);
-            bw.Write(strData.ToArray());
+            BeBinary.WriteInt32(bw, checked((int)(strPool.Length / ptrMul)));
+            if (strPool.TryGetBuffer(out var seg))
+                bw.Write(seg.Array, seg.Offset, seg.Count);
+            else
+                bw.Write(strPool.ToArray());
 
-            string baseName = Path.GetFileNameWithoutExtension(srcName);
-            string dir = Path.GetDirectoryName(srcName) ?? "";
-            string suffix = baseName.StartsWith("$") ? ".IXUD" : ".tbl";
-
-            return (Path.Combine(dir, baseName + suffix), msOut.ToArray());
+            return (srcName, ms2.ToArray());
         }
 
-        static int ReadBE(BinaryReader br)
+        static string ReadString(Stream s, long off, Encoding enc, bool isUtf16)
         {
-            byte[] b = br.ReadBytes(4);
-            return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-        }
+            long p = s.Position;
+            s.Position = off;
 
-        static void WriteBE(BinaryWriter bw, int v)
-        {
-            bw.Write((byte)(v >> 24));
-            bw.Write((byte)(v >> 16));
-            bw.Write((byte)(v >> 8));
-            bw.Write((byte)v);
-        }
-
-        static string ReadString(Stream fs, long offset, bool utf16)
-        {
-            long pos = fs.Position;
-            fs.Position = offset;
-
-            var buf = new List<byte>();
-            if (utf16)
+            var buf = new List<byte>(64);
+            if (isUtf16)
             {
-                while (true)
+                int a, b;
+                while ((a = s.ReadByte()) >= 0 && (b = s.ReadByte()) >= 0 && (a | b) != 0)
                 {
-                    int b1 = fs.ReadByte(), b2 = fs.ReadByte();
-                    if (b1 < 0 || b2 < 0 || (b1 == 0 && b2 == 0)) break;
-                    buf.Add((byte)b1);
-                    buf.Add((byte)b2);
+                    buf.Add((byte)a);
+                    buf.Add((byte)b);
                 }
             }
             else
             {
                 int b;
-                while ((b = fs.ReadByte()) > 0) buf.Add((byte)b);
+                while ((b = s.ReadByte()) > 0) buf.Add((byte)b);
             }
 
-            fs.Position = pos;
-            return utf16
-                ? Encoding.BigEndianUnicode.GetString(buf.ToArray())
-                : Encoding.UTF8.GetString(buf.ToArray());
+            s.Position = p;
+            return buf.Count == 0 ? "" : enc.GetString(buf.ToArray());
         }
     }
 }

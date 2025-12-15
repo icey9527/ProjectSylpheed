@@ -11,9 +11,10 @@ namespace IpfbTool.Archive
 {
     internal static class IpfbUnpack
     {
+        static Manifest _manifest = null!;
         public static void Unpack(string pakPath, string outDir)
         {
-            ListXmlCollector.Clear();
+            _manifest = new Manifest();
             using var fs = new FileStream(pakPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.RandomAccess);
             using var br = new BinaryReader(fs, Encoding.ASCII, true);
 
@@ -47,11 +48,11 @@ namespace IpfbTool.Archive
             {
                 ExtractEntry(pakDir, baseName, e, outDir);
             });
-            LSTA.SaveXml(outDir);
-            RATC.SaveXml(outDir);
-            ListXmlCollector.Save(Path.Combine(outDir, "list.xml"));
+            _manifest.Save(Path.Combine(outDir, "list.xml"));
 
         }
+
+        public static Manifest CurrentManifest => _manifest;
 
         static void ExtractEntry(string pakDir, string baseName, Entry e, string outRoot)
         {
@@ -99,14 +100,12 @@ namespace IpfbTool.Archive
                 name = TryAppendPrefixExtension(name, payload);
             }
 
-            ListXmlCollector.TryAddFromPayload(e.Hash, name, payload);
-
             string outPath = Path.Combine(outRoot, name);
             string? outDirPath = Path.GetDirectoryName(outPath);
             if (!string.IsNullOrEmpty(outDirPath))
                 Directory.CreateDirectory(outDirPath);
 
-            Transformers.ProcessExtract(name, outPath, payload);
+            Transformers.ProcessExtract(name, outPath, payload, _manifest);
         }
 
         static string TryAppendPrefixExtension(string name, byte[] payload)

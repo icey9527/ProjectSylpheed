@@ -10,9 +10,10 @@ namespace IpfbTool.Core
         {
             new TBLR(),
             new ISB(),
-            new T8aD(),
-            new RATC(),
-            new LSTA()
+            new T32(),
+            new TBM(),
+            new PRT(),
+            new FNT()
         };
 
         static readonly Dictionary<string, ITransformer> map = BuildMap();
@@ -26,8 +27,6 @@ namespace IpfbTool.Core
         }
 
         public static IReadOnlyList<string> Available => Array.ConvertAll(list, t => t.GetType().Name);
-
-        public static void PreloadForPack(string rootDir) => T8aD.PreloadHeaderDb(rootDir);
 
         public static bool TryConfigure(string spec, out string error)
         {
@@ -107,13 +106,17 @@ namespace IpfbTool.Core
 
         static bool IsEnabled(ITransformer t) => enabled.Contains(t.GetType().Name);
 
-        public static (string name, string path) ProcessExtract(string name, string outPath, byte[] data)
+        public static (string name, string path) ProcessExtract(string name, string outPath, byte[] data, Manifest manifest)
         {
             foreach (var t in list)
             {
+                if (!t.CanExtract) continue; 
                 if (!IsEnabled(t) || !t.CanTransformOnExtract(name)) continue;
 
-                var (newName, outData) = t.OnExtract(data, name);
+                var (newName, outData) = t.OnExtract(data, name, manifest);
+                if (outData == null)
+                    return (newName, outPath);
+
                 string dir = Path.GetDirectoryName(outPath) ?? "";
                 string newPath = Path.Combine(dir, Path.GetFileName(newName));
 
@@ -131,6 +134,7 @@ namespace IpfbTool.Core
         {
             foreach (var t in list)
             {
+                if (!t.CanPack) continue;
                 if (!IsEnabled(t) || !t.CanTransformOnPack(name)) continue;
                 return t.OnPack(srcPath, name);
             }

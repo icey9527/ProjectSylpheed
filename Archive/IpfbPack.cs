@@ -7,7 +7,6 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using IpfbTool.Core;
-using System.Xml; 
 
 namespace IpfbTool.Archive
 {
@@ -15,13 +14,31 @@ namespace IpfbTool.Archive
     {
         public static void Pack(string inputDir, string pakPath)
         {
-            PackContext.RootDir = inputDir;
-            Transformers.PreloadForPack(inputDir);
-            LSTA.PreloadXml(inputDir);
-            RATC.PreloadXml(inputDir);
+            var manifest = Manifest.Load(Path.Combine(inputDir, "list.xml"));
 
-            var files = CollectFiles(inputDir);
+            var texById = BuildTexIndexById(manifest);
+            var managedPngFull = BuildManagedPngSet(inputDir, manifest);
+            var builtRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             var processed = new ConcurrentDictionary<uint, byte[]>();
+
+            BuildStandaloneTextures(manifest, inputDir, processed, builtRel);
+
+            foreach (var kv in FNT.BuildAll(manifest, inputDir, texById))
+            {
+                uint hash = FileId.FromPath(kv.Key);
+                processed[hash] = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
+                builtRel.Add(NormRel(kv.Key));
+            }
+
+            foreach (var kv in PRT.BuildAll(manifest, inputDir, texById))
+            {
+                uint hash = FileId.FromPath(kv.Key);
+                processed[hash] = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
+                builtRel.Add(NormRel(kv.Key));
+            }
+
+            var files = CollectFiles(inputDir, managedPngFull, builtRel);
 
             Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, rel =>
             {
@@ -32,6 +49,92 @@ namespace IpfbTool.Archive
                 processed[hash] = chunk;
             });
 
+            WritePak(processed, pakPath);
+        }
+
+        static Dictionary<uint, Dictionary<string, string>> BuildTexIndexById(Manifest manifest)
+        {
+            var d = new Dictionary<uint, Dictionary<string, string>>();
+            foreach (var t in manifest.T32)
+            {
+                uint id = TexId.Parse(t.TryGetValue("id", out var s) ? s : "");
+                if (id != 0) d[id] = t;
+            }
+            return d;
+        }
+
+        static HashSet<string> BuildManagedPngSet(string root, Manifest manifest)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var t in manifest.T32)
+            {
+                if (!t.TryGetValue("png", out var rel) || string.IsNullOrWhiteSpace(rel)) continue;
+                set.Add(Path.GetFullPath(Path.Combine(root, rel)));
+            }
+            return set;
+        }
+
+        static void BuildStandaloneTextures(Manifest manifest, string rootDir, ConcurrentDictionary<uint, byte[]> processed, HashSet<string> builtRel)
+        {
+            foreach (var t in manifest.T32)
+            {
+                if (G(t, "type") != "0") continue;
+
+                string name = G(t, "name");
+                if (string.IsNullOrWhiteSpace(name)) continue;
+
+                byte[] data = BuildTextureBytes(t, rootDir);
+                uint hash = FileId.FromPath(name);
+                processed[hash] = ShouldCompress(name) ? CompressCustomBytes(data) : data;
+
+                builtRel.Add(NormRel(name));
+            }
+        }
+
+        static byte[] BuildTextureBytes(Dictionary<string, string> texEntry, string rootDir)
+        {
+            string tex = G(texEntry, "tex");
+            return tex.Equals("TBM", StringComparison.OrdinalIgnoreCase)
+                ? TBM.Build(texEntry, rootDir)
+                : T32.Build(texEntry, rootDir);
+        }
+
+        static List<string> CollectFiles(string root, HashSet<string> managedPngFull, HashSet<string> builtRel)
+        {
+            var list = new List<string>();
+
+            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                string rel = Path.GetRelativePath(root, file);
+                string name = Path.GetFileName(rel);
+
+                if (name.Equals("list.xml", StringComparison.OrdinalIgnoreCase)) continue;
+
+                string relNorm = NormRel(rel);
+                if (builtRel.Contains(relNorm)) continue;
+
+                if (name.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                {
+                    string full = Path.GetFullPath(file);
+                    if (managedPngFull.Contains(full)) continue;
+                }
+
+                list.Add(rel);
+            }
+
+            return list;
+        }
+
+        static bool ShouldCompress(string relPath)
+        {
+            string ext = Path.GetExtension(relPath);
+            if (ext.Equals(".ttf", StringComparison.OrdinalIgnoreCase)) return false;
+            if (ext.Equals(".ttc", StringComparison.OrdinalIgnoreCase)) return false;
+            return true;
+        }
+
+        static void WritePak(ConcurrentDictionary<uint, byte[]> processed, string pakPath)
+        {
             var sortedHashes = processed.Keys.OrderBy(h => h).ToList();
             string pakDir = Path.GetDirectoryName(pakPath) ?? "";
             string baseName = Path.GetFileNameWithoutExtension(pakPath);
@@ -79,68 +182,6 @@ namespace IpfbTool.Archive
             }
         }
 
-static List<string> CollectFiles(string root)
-{
-    var skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-    foreach (var xml in Directory.EnumerateFiles(root, "*.xml", SearchOption.AllDirectories))
-    {
-        try
-        {
-            var doc = new XmlDocument();
-            doc.Load(xml);
-            string dir = Path.GetDirectoryName(xml) ?? "";
-
-            if (doc.DocumentElement?.Name == "RATC")
-            {
-                foreach (XmlElement file in doc.DocumentElement.SelectNodes("file")!)
-                foreach (XmlElement item in file.SelectNodes("item")!)
-                {
-                    string name = item.GetAttribute("name");
-                    skip.Add(Path.Combine(dir, name + ".png"));
-                }
-            }
-            else if (doc.DocumentElement?.Name == "LSTA")
-            {
-                foreach (XmlElement file in doc.DocumentElement.SelectNodes("file")!)
-                {
-                    string fileName = file.GetAttribute("name");
-                    foreach (XmlElement item in file.SelectNodes("item")!)
-                    {
-                        int index = int.TryParse(item.GetAttribute("index"), out int i) ? i : -1;
-                        if (index > 0)
-                            skip.Add(Path.Combine(dir, $"{fileName}.{index}.png"));
-                    }
-                }
-            }
-        }
-        catch { }
-    }
-
-    var list = new List<string>();
-    foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
-    {
-        string rel = Path.GetRelativePath(root, file);
-        string name = Path.GetFileName(rel);
-        if (name.Equals("list.xml", StringComparison.OrdinalIgnoreCase)) continue;
-        if (name.Equals("RATC.xml", StringComparison.OrdinalIgnoreCase)) continue;
-        if (name.Equals("LSTA.xml", StringComparison.OrdinalIgnoreCase)) continue;
-        if (name.Equals("Non-compression-list.txt", StringComparison.OrdinalIgnoreCase)) continue;
-        if (skip.Contains(file)) continue;
-        list.Add(rel);
-    }
-    return list;
-}
-
-        static bool ShouldCompress(string relPath)
-        {
-            string ext = Path.GetExtension(relPath);
-            if (ext.Equals(".ttf", StringComparison.OrdinalIgnoreCase)) return false;
-            if (ext.Equals(".ttc", StringComparison.OrdinalIgnoreCase)) return false;
-            if (Path.GetFileName(relPath).StartsWith("$DA45E966", StringComparison.OrdinalIgnoreCase)) return false;
-            return true;
-        }
-
         static byte[] CompressCustomBytes(byte[] raw)
         {
             using var compMs = new MemoryStream();
@@ -162,7 +203,6 @@ static List<string> CollectFiles(string root)
             int p = 12 + comp.Length;
             result[p] = (byte)(adler >> 24); result[p + 1] = (byte)(adler >> 16);
             result[p + 2] = (byte)(adler >> 8); result[p + 3] = (byte)adler;
-
             return result;
         }
 
@@ -176,6 +216,11 @@ static List<string> CollectFiles(string root)
             }
             return (b << 16) | a;
         }
+
+        static string G(Dictionary<string, string> d, string k, string def = "")
+            => d.TryGetValue(k, out var v) && !string.IsNullOrWhiteSpace(v) ? v : def;
+
+        static string NormRel(string rel) => rel.Replace('\\', '/');
 
         sealed class Entry { public uint Hash; public int Offset, Size; }
     }
