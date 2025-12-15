@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -158,32 +159,46 @@ namespace IpfbTool.Core
                 if (r.Peek4(OptMagic))
                 {
                     r.Skip(4);
+
                     uint nameLen = r.U32();
                     if (nameLen == 0 || nameLen > 4096 || r.Remaining < nameLen) break;
-
                     string itemName = r.StrVar((int)nameLen);
 
                     uint size = r.U32();
                     if (size == 0 || r.Remaining < size) break;
-
                     byte[] payload = r.Bytes((int)size);
 
                     uint imgId = TexId.Embedded("PRT", srcName, itemName);
+
                     string filePart = Path.GetFileName(itemName);
                     if (string.IsNullOrWhiteSpace(filePart)) filePart = $"item_{itemIndex}";
                     string pngRel = Path.Combine(folderRel, filePart + ".png");
 
-                    manifest.AddPRT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    string magic4 = payload.Length >= 4 ? Encoding.ASCII.GetString(payload, 0, 4) : "";
+
+                    var entry = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                     {
                         ["kind"] = "item",
                         ["container"] = srcName,
                         ["index"] = itemIndex.ToString(),
                         ["img_id"] = TexId.ToX8(imgId),
-                        ["img_name"] = itemName
-                    });
+                        ["img_name"] = itemName,
+                        ["payload_size"] = payload.Length.ToString(),
+                        ["payload_magic"] = magic4
+                    };
 
                     if (TryExtractTexture(payload, imgId, itemName, "2", pngRel, manifest, out var png))
+                    {
+                        entry["payload_kind"] = "texture";
+                        manifest.AddPRT(entry);
                         WriteOut(pngRel, png);
+                    }
+                    else
+                    {
+                        entry["payload_kind"] = "raw";
+                        entry["payload_b64"] = Convert.ToBase64String(payload);
+                        manifest.AddPRT(entry);
+                    }
 
                     itemIndex++;
                     continue;
@@ -225,26 +240,26 @@ namespace IpfbTool.Core
                 ushort endPos = (ushort)ParseU32(header, "end_pos");
                 uint priority = ParseU32(header, "priority");
                 uint numObjects = ParseU32(header, "num_objects");
-                int screenW = (int)ParseU32(header, "screen_w");
-                int screenH = (int)ParseU32(header, "screen_h");
+                int screenW = ParseI32(header, "screen_w");
+                int screenH = ParseI32(header, "screen_h");
 
                 bool hasScreen = classTag == RATC;
                 int objSize = classTag == RATB ? 60 : (classTag == RATA ? 56 : 60);
 
                 var objs = items.Where(d => Get(d, "kind").Equals("obj", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(d => (int)ParseU32(d, "index"))
+                    .OrderBy(d => ParseI32(d, "index"))
                     .ToList();
 
                 var keysets = items.Where(d => Get(d, "kind").Equals("keyset", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(d => (int)ParseU32(d, "set"))
+                    .OrderBy(d => ParseI32(d, "set"))
                     .ToList();
 
                 var keys = items.Where(d => Get(d, "kind").Equals("key", StringComparison.OrdinalIgnoreCase))
-                    .GroupBy(d => (int)ParseU32(d, "set"))
-                    .ToDictionary(gk => gk.Key, gk => gk.OrderBy(x => (int)ParseU32(x, "index")).ToList());
+                    .GroupBy(d => ParseI32(d, "set"))
+                    .ToDictionary(gk => gk.Key, gk => gk.OrderBy(x => ParseI32(x, "index")).ToList());
 
                 var sub = items.Where(d => Get(d, "kind").Equals("item", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(d => (int)ParseU32(d, "index"))
+                    .OrderBy(d => ParseI32(d, "index"))
                     .ToList();
 
                 using var ms = new MemoryStream();
@@ -266,20 +281,20 @@ namespace IpfbTool.Core
 
                 for (int i = 0; i < numObjects; i++)
                 {
-                    var o = i < objs.Count ? objs[i] : new Dictionary<string, string>();
+                    var o = i < objs.Count ? objs[i] : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     WriteFixed32(ms, Get(o, "szFileName"));
-                    WriteI32(ms, (int)ParseU32(o, "lParent"));
-                    WriteI32(ms, (int)ParseU32(o, "lMaster"));
+                    WriteI32(ms, ParseI32(o, "lParent"));
+                    WriteI32(ms, ParseI32(o, "lMaster"));
                     WriteU32(ms, ParseU32(o, "state"));
-                    WriteI32(ms, (int)ParseU32(o, "buttonID"));
-                    WriteI32(ms, (int)ParseU32(o, "centerX"));
-                    WriteI32(ms, (int)ParseU32(o, "centerY"));
-                    if (objSize == 60) WriteI32(ms, (int)ParseU32(o, "centerZ"));
+                    WriteI32(ms, ParseI32(o, "buttonID"));
+                    WriteI32(ms, ParseI32(o, "centerX"));
+                    WriteI32(ms, ParseI32(o, "centerY"));
+                    if (objSize == 60) WriteI32(ms, ParseI32(o, "centerZ"));
                 }
 
                 for (int set = 0; set < numObjects; set++)
                 {
-                    var ks = set < keysets.Count ? keysets[set] : new Dictionary<string, string>();
+                    var ks = set < keysets.Count ? keysets[set] : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     uint ownerID = ParseU32(ks, "ownerID");
                     uint numKeys = ParseU32(ks, "numKeys");
 
@@ -290,29 +305,37 @@ namespace IpfbTool.Core
 
                     for (int k = 0; k < numKeys; k++)
                     {
-                        var key = k < list.Count ? list[k] : new Dictionary<string, string>();
+                        var key = k < list.Count ? list[k] : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-                        WriteI32(ms, (int)ParseU32(key, "pos"));
+                        WriteI32(ms, ParseI32(key, "pos"));
                         WriteU32(ms, ParseU32(key, "diffuse"));
-                        WriteI32(ms, (int)ParseU32(key, "yaw"));
-                        WriteI32(ms, (int)ParseU32(key, "pitch"));
-                        WriteI32(ms, (int)ParseU32(key, "roll"));
-                        WriteI32(ms, (int)ParseU32(key, "stretchX"));
-                        WriteI32(ms, (int)ParseU32(key, "stretchY"));
-                        WriteI32(ms, (int)ParseU32(key, "soundID"));
-                        WriteI32(ms, (int)ParseU32(key, "pt_x"));
-                        WriteI32(ms, (int)ParseU32(key, "pt_y"));
+                        WriteI32(ms, ParseI32(key, "yaw"));
+                        WriteI32(ms, ParseI32(key, "pitch"));
+                        WriteI32(ms, ParseI32(key, "roll"));
+                        WriteI32(ms, ParseI32(key, "stretchX"));
+                        WriteI32(ms, ParseI32(key, "stretchY"));
+                        WriteI32(ms, ParseI32(key, "soundID"));
+                        WriteI32(ms, ParseI32(key, "pt_x"));
+                        WriteI32(ms, ParseI32(key, "pt_y"));
                     }
                 }
 
                 foreach (var it in sub)
                 {
-                    uint imgId = TexId.Parse(Get(it, "img_id"));
                     string imgName = Get(it, "img_name");
+                    string b64 = Get(it, "payload_b64");
 
-                    if (imgId == 0 || !texById.TryGetValue(imgId, out var texEntry)) continue;
-
-                    byte[] payload = BuildTexture(texEntry, rootDir);
+                    byte[] payload;
+                    if (!string.IsNullOrEmpty(b64))
+                    {
+                        payload = Convert.FromBase64String(b64);
+                    }
+                    else
+                    {
+                        uint imgId = TexId.Parse(Get(it, "img_id"));
+                        if (imgId == 0 || !texById.TryGetValue(imgId, out var texEntry)) continue;
+                        payload = BuildTexture(texEntry, rootDir);
+                    }
 
                     ms.Write(OptMagic);
 
@@ -376,13 +399,42 @@ namespace IpfbTool.Core
         }
 
         static string Get(Dictionary<string, string> d, string k) =>
-            d != null && d.TryGetValue(k, out var v) ? v : "";
+            d != null && d.TryGetValue(k, out var v) ? (v ?? "") : "";
 
         static uint ParseU32(Dictionary<string, string> d, string k)
         {
-            string s = Get(d, k);
-            if (uint.TryParse(s, out var v)) return v;
+            string s = Get(d, k).Trim();
+            if (string.IsNullOrEmpty(s)) return 0;
+
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+                uint.TryParse(s.AsSpan(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hx))
+                return hx;
+
+            if (uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
+                return u;
+
+            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+                return unchecked((uint)i);
+
             return TexId.Parse(s);
+        }
+
+        static int ParseI32(Dictionary<string, string> d, string k)
+        {
+            string s = Get(d, k).Trim();
+            if (string.IsNullOrEmpty(s)) return 0;
+
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+                uint.TryParse(s.AsSpan(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hx))
+                return unchecked((int)hx);
+
+            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+                return i;
+
+            if (uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
+                return unchecked((int)u);
+
+            return unchecked((int)TexId.Parse(s));
         }
 
         static void WriteU32(Stream s, uint v)
@@ -499,8 +551,6 @@ namespace IpfbTool.Core
                 p += n;
                 if (p > d.Length) p = d.Length;
             }
-
-            
         }
     }
 }

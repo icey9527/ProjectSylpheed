@@ -8,7 +8,7 @@ namespace IpfbTool.Core
     {
         static readonly ITransformer[] list =
         {
-            new TBLR(),
+            new TBL(),
             new ISB(),
             new T32(),
             new TBM(),
@@ -106,11 +106,24 @@ namespace IpfbTool.Core
 
         static bool IsEnabled(ITransformer t) => enabled.Contains(t.GetType().Name);
 
+        internal static bool TryGetPackTransformer(string name, out ITransformer transformer)
+        {
+            foreach (var t in list)
+            {
+                if (!t.CanPack) continue;
+                if (!IsEnabled(t) || !t.CanTransformOnPack(name)) continue;
+                transformer = t;
+                return true;
+            }
+            transformer = null!;
+            return false;
+        }
+
         public static (string name, string path) ProcessExtract(string name, string outPath, byte[] data, Manifest manifest)
         {
             foreach (var t in list)
             {
-                if (!t.CanExtract) continue; 
+                if (!t.CanExtract) continue;
                 if (!IsEnabled(t) || !t.CanTransformOnExtract(name)) continue;
 
                 var (newName, outData) = t.OnExtract(data, name, manifest);

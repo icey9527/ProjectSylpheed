@@ -5,9 +5,9 @@ using System.Text;
 
 namespace IpfbTool.Core
 {
-    internal sealed class TBLR : ITransformer
+    internal sealed class TBL : ITransformer
     {
-        static TBLR()
+        static TBL()
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         }
