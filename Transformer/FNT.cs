@@ -37,7 +37,7 @@ namespace IpfbTool.Core
             int pos = 8;
             for (int i = 0; i < count; i++)
             {
-                if (pos + EntryHeaderSize > srcData.Length) break;
+                //if (pos + EntryHeaderSize > srcData.Length) break;
 
                 ushort charCode = (ushort)((srcData[pos] << 8) | srcData[pos + 1]);
                 byte isExternal = srcData[pos + 2];
@@ -46,7 +46,7 @@ namespace IpfbTool.Core
                 int dataSize = unchecked((int)TextureUtil.ReadU32BE(srcData, pos + 11));
                 pos += EntryHeaderSize;
 
-                if (dataSize < 0 || pos + dataSize > srcData.Length) break;
+                //if (dataSize < 0 || pos + dataSize > srcData.Length) break;
 
                 string imgName = charCode.ToString("X4");
                 uint imgId = TexId.Embedded("FNT", srcName, i.ToString());

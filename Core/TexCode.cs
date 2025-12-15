@@ -69,7 +69,7 @@ namespace IpfbTool.Core
             for (int i = 0; i < parts; i++)
             {
                 int blockOfs = BeBinary.ReadInt32(data, 0x2C + i * 4);
-                if (blockOfs < 0 || blockOfs + 0x10 > data.Length) continue;
+                //if (blockOfs < 0 || blockOfs + 0x10 > data.Length) continue;
 
                 int x = BeBinary.ReadInt32(data, blockOfs);
                 int y = BeBinary.ReadInt32(data, blockOfs + 4);

@@ -214,6 +214,7 @@ namespace IpfbTool.Core
 
                 if (TryParseCmdCall(body, out string cmdName, out string argList))
                 {
+                    int opcodePos = block.Count;
                     WriteU32(block, 0x0000u); // opcode
                     WriteU32(block, Hash.Filehash(cmdName));
 
@@ -221,6 +222,13 @@ namespace IpfbTool.Core
                         WriteCmdParam(block, a, curKey);
 
                     WriteU32(block, P_END);
+
+                    // extra = paramLen：对 CMD 来说就是 (块长度 - 8) = (总长 - (头4 + hash4))
+                    int paramLen = block.Count - opcodePos - 8;
+                    // 写到头的 high16（小端）：block[2]=低字节，block[3]=高字节
+                    block[opcodePos + 2] = (byte)paramLen;
+                    block[opcodePos + 3] = (byte)(paramLen >> 8);
+
                 }
                 else
                 {
@@ -240,9 +248,19 @@ namespace IpfbTool.Core
 
                         var ops = opsPart.Length == 0 ? Array.Empty<string>() : SplitOps(opsPart);
                         ushort opcode = ResolveOpcode(mnem, ops);
+                        int opcodePos = block.Count;
                         WriteU32(block, opcode);
-
+                        
                         WriteOperands(block, opcode, ops);
+
+                        // extra = len-4（payload长度）
+                        int paramLen = block.Count - opcodePos - 4;
+                        if ((uint)paramLen > 0xFFFFu)
+                            throw new InvalidOperationException($"paramLen overflow at line {li + 1}: {paramLen}");
+
+                        block[opcodePos + 2] = (byte)paramLen;
+                        block[opcodePos + 3] = (byte)(paramLen >> 8);
+
                     }
                 }
 
@@ -414,7 +432,7 @@ namespace IpfbTool.Core
             {
                 WriteU32(block, P_WSTR);
                 string s = Unescape(token.Substring(2, token.Length - 3));
-                WriteEncBytes(block, Encoding.Unicode.GetBytes(s), key); // UTF-16LE
+                WriteEncBytes(block, Encoding.Unicode.GetBytes(s), key);
                 return;
             }
 
