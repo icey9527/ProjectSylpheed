@@ -3,8 +3,8 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Text;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace IpfbTool.Core
 {
@@ -18,7 +18,8 @@ namespace IpfbTool.Core
         const uint P_END = 0x0401;
 
         static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
-        static readonly Encoding Utf16BE = Encoding.BigEndianUnicode;
+        static readonly Encoding Sjis = InitSjis();
+        static readonly byte[] EllipsisSjis2 = InitEllipsis2();
 
         static readonly string[] CmdNames =
         {
@@ -33,7 +34,7 @@ namespace IpfbTool.Core
             "Challenge01","Challenge02","Challenge03","Challenge04","Challenge05","Challenge06",
             "CloseCtrl","CloseReadyRoom","HideCtrl","LoadCtrl","MapWait","NewGame","OpenReadyRoom","OpenReadyRoomFirst",
             "ShowCtrl","TextWait",
-            "Tutorial_0101","Tutorial_0102","Tutorial_0103","Tutorial_0201","Tutorial_0301","Tutorial_0401",
+            "Tutorial_0101","Tutorial_0102","Tutorial_0103","Tutorial_0201","Tutorial_0301","Tutorial_0302","Tutorial_0401",
             "Tutorial_0501","Tutorial_0601",
             "WindowClose","WindowOpen"
         };
@@ -41,7 +42,6 @@ namespace IpfbTool.Core
         static readonly Dictionary<uint, string> CmdByFileHash = BuildCmdByFileHash();
         static readonly Dictionary<uint, string> CallByMakeStrId = BuildCallByMakeStrId();
 
-        // name -> opcode(根据操作数类型选择)
         static readonly Dictionary<ushort, (string Name, string? Fmt)> Opcodes = new()
         {
             { 0x0000, ("CMD",  null) },
@@ -104,6 +104,9 @@ namespace IpfbTool.Core
 
         static readonly Dictionary<string, ushort> NameToOpcodeBase = BuildNameToOpcodeBase();
 
+        public bool CanExtract => true;
+        public bool CanPack => true;
+
         public bool CanTransformOnExtract(string n) =>
             Path.GetExtension(n).Equals(".isb", StringComparison.OrdinalIgnoreCase);
 
@@ -132,9 +135,12 @@ namespace IpfbTool.Core
             {
                 ReadHeader(src, addrs, tblStart, blocks, b, out uint key, out uint msgs);
 
-                sb.Append(key.ToString("X8")).Append(':').Append(msgs.ToString(CultureInfo.InvariantCulture)).AppendLine(" {");
+                sb.Append(key.ToString("X8"))
+                  .Append(':')
+                  .Append(msgs.ToString(CultureInfo.InvariantCulture))
+                  .AppendLine(" {");
 
-                b++; // header 后面开始读指令块
+                b++;
 
                 while (b < blocks)
                 {
@@ -158,39 +164,40 @@ namespace IpfbTool.Core
 
         public (string, byte[]) OnPack(string p, string n)
         {
-            var file = new List<byte>(4096);
-
-
-            var offsets = new List<uint>(1024);
+            var file = new List<byte>(64 * 1024);
+            var offsets = new List<uint>(4096);
 
             uint curKey = 0;
-            uint curMsgs = 0;
             bool inScenario = false;
 
             using var sr = new StreamReader(p, Utf8NoBom, detectEncodingFromByteOrderMarks: true);
+
+            var block = new List<byte>(256);
+            var argBuf = new List<string>(16);
+
             string? raw;
             int li = 0;
 
             while ((raw = sr.ReadLine()) != null)
-            {               
+            {
                 li++;
-                string line = raw.Trim();
-                if (line.Length == 0) continue;
+                if (raw.Length == 0) continue;
 
-                if (line.EndsWith("{", StringComparison.Ordinal))
+                string trimmed = raw.Trim();
+                if (trimmed.Length == 0) continue;
+
+                if (trimmed.EndsWith("{", StringComparison.Ordinal))
                 {
-                    // KEY:MSGS {
-                    string head = line.Substring(0, line.Length - 1).Trim();
+                    string head = trimmed.Substring(0, trimmed.Length - 1).Trim();
                     int colon = head.IndexOf(':');
-                    if (colon <= 0) throw new FormatException($"Bad header at line {li + 1}: {raw}");
+                    if (colon <= 0) throw new FormatException($"Bad header at line {li}: {raw}");
 
                     string keyStr = head.Substring(0, colon).Trim();
                     string msgStr = head.Substring(colon + 1).Trim();
 
                     curKey = ParseHexU32(keyStr);
-                    curMsgs = ParseU32(msgStr);
+                    uint curMsgs = ParseU32(msgStr);
 
-                    // header block
                     offsets.Add((uint)file.Count);
                     WriteU32(file, curKey);
                     WriteU32(file, curMsgs);
@@ -199,40 +206,78 @@ namespace IpfbTool.Core
                     continue;
                 }
 
-                if (line == "}")
+                if (trimmed == "}")
                 {
                     inScenario = false;
                     continue;
                 }
 
-                if (!inScenario)
-                    continue;
+                if (!inScenario) continue;
 
-                // instruction block
-                var block = new List<byte>(64);
-                string body = raw.TrimStart();
-
-                if (TryParseCmdCall(body, out string cmdName, out string argList))
+                if (TryParseBlockHeader(trimmed, out string blockCmd, out string headerArgs))
                 {
-                    int opcodePos = block.Count;
-                    WriteU32(block, 0x0000u); // opcode
-                    WriteU32(block, Hash.Filehash(cmdName));
+                    if (!TryReadBlock(sr, ref li, blockCmd, out var lines))
+                        throw new FormatException($"Unclosed {blockCmd} block near line {li}");
 
-                    foreach (var a in SplitArgs(argList))
-                        WriteCmdParam(block, a, curKey);
+                    block.Clear();
+
+                    int opcodePos = block.Count;
+                    WriteU32(block, 0x0000u);
+                    WriteU32(block, Hash.Filehash(blockCmd));
+
+                    SplitArgsTo(headerArgs, argBuf);
+                    for (int i = 0; i < argBuf.Count; i++)
+                        WriteCmdParam(block, argBuf[i], curKey, blockCmd);
+
+                    for (int i = 0; i < lines.Count; i++)
+                    {
+                        WriteU32(block, P_WSTR);
+                        WriteEncBytes(block, Encoding.Unicode.GetBytes(lines[i]), curKey, blockCmd);
+                    }
 
                     WriteU32(block, P_END);
 
-                    // extra = paramLen：对 CMD 来说就是 (块长度 - 8) = (总长 - (头4 + hash4))
                     int paramLen = block.Count - opcodePos - 8;
-                    // 写到头的 high16（小端）：block[2]=低字节，block[3]=高字节
+                    if ((uint)paramLen > 0xFFFFu)
+                        throw new InvalidOperationException($"paramLen overflow at line {li}: {paramLen}");
                     block[opcodePos + 2] = (byte)paramLen;
                     block[opcodePos + 3] = (byte)(paramLen >> 8);
 
+                    if ((block.Count & 3) != 0)
+                        throw new InvalidOperationException($"Block not aligned at line {li}");
+
+                    offsets.Add((uint)file.Count);
+                    file.AddRange(block);
+                    continue;
+                }
+
+                block.Clear();
+
+                string body = raw;
+
+                if (TryParseCmdCallHeader(body, out string cmdName, out string argsText))
+                {
+                    int opcodePos = block.Count;
+                    WriteU32(block, 0x0000u);
+                    WriteU32(block, Hash.Filehash(cmdName));
+
+                    SplitArgsTo(argsText, argBuf);
+                    for (int i = 0; i < argBuf.Count; i++)
+                        WriteCmdParam(block, argBuf[i], curKey, cmdName);
+
+                    WriteU32(block, P_END);
+
+                    int paramLen = block.Count - opcodePos - 8;
+                    if ((uint)paramLen > 0xFFFFu)
+                        throw new InvalidOperationException($"paramLen overflow at line {li}: {paramLen}");
+
+                    block[opcodePos + 2] = (byte)paramLen;
+                    block[opcodePos + 3] = (byte)(paramLen >> 8);
                 }
                 else
                 {
                     string ins = body.Trim();
+
                     if (ins.Equals("RET", StringComparison.OrdinalIgnoreCase) ||
                         ins.Equals("return", StringComparison.OrdinalIgnoreCase))
                     {
@@ -246,33 +291,30 @@ namespace IpfbTool.Core
                         if (sp < 0) { mnem = ins; opsPart = ""; }
                         else { mnem = ins.Substring(0, sp).Trim(); opsPart = ins.Substring(sp + 1).Trim(); }
 
-                        var ops = opsPart.Length == 0 ? Array.Empty<string>() : SplitOps(opsPart);
+                        string[] ops = opsPart.Length == 0 ? Array.Empty<string>() : SplitOps(opsPart);
                         ushort opcode = ResolveOpcode(mnem, ops);
+
                         int opcodePos = block.Count;
                         WriteU32(block, opcode);
-                        
                         WriteOperands(block, opcode, ops);
 
-                        // extra = len-4（payload长度）
                         int paramLen = block.Count - opcodePos - 4;
                         if ((uint)paramLen > 0xFFFFu)
-                            throw new InvalidOperationException($"paramLen overflow at line {li + 1}: {paramLen}");
+                            throw new InvalidOperationException($"paramLen overflow at line {li}: {paramLen}");
 
                         block[opcodePos + 2] = (byte)paramLen;
                         block[opcodePos + 3] = (byte)(paramLen >> 8);
-
                     }
                 }
 
                 if ((block.Count & 3) != 0)
-                    throw new InvalidOperationException($"Block not aligned at line {li + 1}");
+                    throw new InvalidOperationException($"Block not aligned at line {li}");
 
                 offsets.Add((uint)file.Count);
                 file.AddRange(block);
             }
 
             int blocks = offsets.Count;
-            int tblStart = file.Count;
 
             for (int i = 0; i < blocks; i++)
                 WriteU32(file, offsets[i]);
@@ -280,6 +322,63 @@ namespace IpfbTool.Core
             WriteU32(file, (uint)blocks);
 
             return (Path.ChangeExtension(n, ".isb"), file.ToArray());
+        }
+
+        static bool TryParseBlockHeader(string trimmedLine, out string cmdName, out string headerArgs)
+        {
+            cmdName = "";
+            headerArgs = "";
+
+            int p = trimmedLine.IndexOf('(');
+            if (p <= 0) return false;
+
+            cmdName = trimmedLine.Substring(0, p).Trim();
+            if (cmdName.Length == 0) return false;
+
+            headerArgs = trimmedLine.Substring(p + 1);
+
+            if (headerArgs.EndsWith(")", StringComparison.Ordinal))
+                return false;
+
+            return true;
+        }
+
+        static bool TryReadBlock(StreamReader sr, ref int li, string cmdName, out List<string> lines)
+        {
+            lines = new List<string>();
+            string end = cmdName + ")";
+
+            while (true)
+            {
+                string? raw = sr.ReadLine();
+                if (raw == null) return false;
+                li++;
+
+                if (raw.Trim().Equals(end, StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                lines.Add(raw);
+            }
+        }
+
+        static bool TryParseCmdCallHeader(string line, out string name, out string args)
+        {
+            name = "";
+            args = "";
+
+            int p = line.IndexOf('(');
+            if (p <= 0) return false;
+
+            string s = line.TrimEnd();
+            if (!s.EndsWith(")", StringComparison.Ordinal)) return false;
+
+            name = line.Substring(0, p).Trim();
+
+            int last = s.LastIndexOf(')');
+            if (last <= p) return false;
+
+            args = s.Substring(p + 1, last - p - 1);
+            return name.Length != 0;
         }
 
         static void ReadHeader(byte[] src, uint[] addrs, int tblStart, int blocks, int b, out uint key, out uint msgs)
@@ -305,15 +404,17 @@ namespace IpfbTool.Core
 
             ushort op = (ushort)(first & 0xFFFF);
             if (!Opcodes.TryGetValue(op, out var def))
-                return ($"  unk_{op:X4}", false);
+                return ($"unk_{op:X4}", false);
 
             if (def.Fmt is null)
             {
                 if (!TryReadU32LE(data, ref pos, (int)end, out uint h))
-                    return ("  CMD(?)", false);
+                    return ("CMD(?)", false);
 
                 string cmdName = CmdByFileHash.TryGetValue(h, out var n) ? n : $"0x{h:X8}";
-                var ps = new List<string>();
+
+                var ps = new List<string>(8);
+                var wstrs = new List<string>(8);
 
                 while (true)
                 {
@@ -332,7 +433,7 @@ namespace IpfbTool.Core
                     }
                     else if (ptype == P_WSTR)
                     {
-                        ps.Add($"L\"{Escape(ReadEncWString(data, ref pos, (int)end, key))}\"");
+                        wstrs.Add(ReadEncWString(data, ref pos, (int)end, key));
                     }
                     else if (ptype == P_STR)
                     {
@@ -350,41 +451,56 @@ namespace IpfbTool.Core
                     }
                 }
 
-                return ($"  {cmdName}({string.Join(", ", ps)})", false);
+                if (wstrs.Count > 0)
+                {
+                    var sb = new StringBuilder();
+                    sb.Append(cmdName).Append('(');
+                    if (ps.Count != 0) sb.Append(string.Join(", ", ps));
+                    sb.Append('\n');
+
+                    for (int i = 0; i < wstrs.Count; i++)
+                        sb.Append(wstrs[i]).Append('\n');
+
+                    sb.Append(cmdName).Append(')');
+                    return (sb.ToString(), false);
+                }
+
+                return ($"{cmdName}({string.Join(", ", ps)})", false);
             }
 
             if (def.Fmt.Length == 0)
-                return ($"  {def.Name}", op == 0x0401);
+                return (def.Name, op == 0x0401);
 
             var args = new List<string>(def.Fmt.Length);
-            foreach (char c in def.Fmt)
+            for (int i = 0; i < def.Fmt.Length; i++)
             {
+                char c = def.Fmt[i];
                 switch (c)
                 {
                     case 'v':
-                        if (!TryReadU32LE(data, ref pos, (int)end, out uint v)) return ($"  {def.Name} ?", false);
+                        if (!TryReadU32LE(data, ref pos, (int)end, out uint v)) return ($"{def.Name} ?", false);
                         args.Add($"@{v:X8}");
                         break;
                     case 'p':
-                        if (!TryReadU32LE(data, ref pos, (int)end, out uint p)) return ($"  {def.Name} ?", false);
+                        if (!TryReadU32LE(data, ref pos, (int)end, out uint p)) return ($"{def.Name} ?", false);
                         args.Add($"*{p:X8}");
                         break;
                     case 'i':
-                        if (!TryReadI32LE(data, ref pos, (int)end, out int iv)) return ($"  {def.Name} ?", false);
+                        if (!TryReadI32LE(data, ref pos, (int)end, out int iv)) return ($"{def.Name} ?", false);
                         args.Add(iv.ToString(CultureInfo.InvariantCulture));
                         break;
                     case 'l':
-                        if (!TryReadU32LE(data, ref pos, (int)end, out uint l)) return ($"  {def.Name} ?", false);
+                        if (!TryReadU32LE(data, ref pos, (int)end, out uint l)) return ($"{def.Name} ?", false);
                         args.Add($"L{l}");
                         break;
                     case 's':
-                        if (!TryReadU32LE(data, ref pos, (int)end, out uint sid)) return ($"  {def.Name} ?", false);
+                        if (!TryReadU32LE(data, ref pos, (int)end, out uint sid)) return ($"{def.Name} ?", false);
                         args.Add(CallByMakeStrId.TryGetValue(sid, out var sn) ? sn : $"#{sid:X8}");
                         break;
                 }
             }
 
-            return ($"  {def.Name} {string.Join(", ", args)}", op == 0x0401);
+            return ($"{def.Name} {string.Join(", ", args)}", op == 0x0401);
         }
 
         static void WriteOperands(List<byte> block, ushort opcode, string[] ops)
@@ -402,47 +518,20 @@ namespace IpfbTool.Core
 
                 switch (c)
                 {
-                    case 'v':
-                        WriteU32(block, ParseVarU32(t));
-                        break;
-                    case 'p':
-                        WriteU32(block, ParsePtrU32(t));
-                        break;
-                    case 'i':
-                        WriteI32(block, ParseI32(t));
-                        break;
-                    case 'l':
-                        WriteU32(block, ParseLabelU32(t));
-                        break;
-                    case 's':
-                        WriteU32(block, ParseSymbolU32(t));
-                        break;
-                    default:
-                        throw new FormatException($"Unknown operand fmt '{c}'");
+                    case 'v': WriteU32(block, ParseVarU32(t)); break;
+                    case 'p': WriteU32(block, ParsePtrU32(t)); break;
+                    case 'i': WriteI32(block, ParseI32(t)); break;
+                    case 'l': WriteU32(block, ParseLabelU32(t)); break;
+                    case 's': WriteU32(block, ParseSymbolU32(t)); break;
+                    default: throw new FormatException($"Unknown operand fmt '{c}'");
                 }
             }
         }
 
-        static void WriteCmdParam(List<byte> block, string token, uint key)
+        static void WriteCmdParam(List<byte> block, string token, uint key, string cmdName)
         {
             token = token.Trim();
             if (token.Length == 0) return;
-
-            if (token.StartsWith("L\"", StringComparison.Ordinal) && token.EndsWith("\"", StringComparison.Ordinal))
-            {
-                WriteU32(block, P_WSTR);
-                string s = Unescape(token.Substring(2, token.Length - 3));
-                WriteEncBytes(block, Encoding.Unicode.GetBytes(s), key); // UTF-16LE
-                return;
-            }
-
-            if (token.StartsWith("\"", StringComparison.Ordinal) && token.EndsWith("\"", StringComparison.Ordinal))
-            {
-                WriteU32(block, P_STR);
-                string s = Unescape(token.Substring(1, token.Length - 2));
-                WriteEncBytes(block, Encoding.ASCII.GetBytes(s), key);
-                return;
-            }
 
             if (token.StartsWith("@", StringComparison.Ordinal))
             {
@@ -459,11 +548,34 @@ namespace IpfbTool.Core
                 return;
             }
 
-            WriteU32(block, P_INT);
-            WriteI32(block, ParseI32(token));
+            if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out int iv2))
+            {
+                WriteU32(block, P_INT);
+                WriteI32(block, iv2);
+                return;
+            }
+
+            if (token.StartsWith("L\"", StringComparison.Ordinal) && token.EndsWith("\"", StringComparison.Ordinal))
+            {
+                WriteU32(block, P_WSTR);
+                string s = Unescape(token.Substring(2, token.Length - 3));
+                WriteEncBytes(block, Encoding.Unicode.GetBytes(s), key, cmdName);
+                return;
+            }
+
+            if (token.StartsWith("\"", StringComparison.Ordinal) && token.EndsWith("\"", StringComparison.Ordinal))
+            {
+                WriteU32(block, P_STR);
+                string s = Unescape(token.Substring(1, token.Length - 2));
+                WriteEncBytes(block, Encoding.ASCII.GetBytes(s), key, cmdName);
+                return;
+            }
+
+            WriteU32(block, P_WSTR);
+            WriteEncBytes(block, Encoding.Unicode.GetBytes(token), key, cmdName);
         }
 
-        static void WriteEncBytes(List<byte> dst, byte[] plainBytes, uint key)
+        static void WriteEncBytes(List<byte> dst, byte[] plainBytes, uint key, string cmdName)
         {
             uint len = (uint)plainBytes.Length;
             WriteU32(dst, len);
@@ -473,6 +585,12 @@ namespace IpfbTool.Core
             tmp.Clear();
             plainBytes.CopyTo(tmp);
 
+            if ((plainBytes.Length & 3) == 2 && cmdName.Equals("text", StringComparison.OrdinalIgnoreCase))
+            {
+                if (EllipsisSjis2.Length == 2)
+                    EllipsisSjis2.AsSpan(0, 2).CopyTo(tmp.Slice(plainBytes.Length, 2));
+            }
+
             for (int off = 0; off < aligned; off += 4)
             {
                 uint w = BinaryPrimitives.ReadUInt32LittleEndian(tmp.Slice(off, 4));
@@ -481,25 +599,10 @@ namespace IpfbTool.Core
             }
         }
 
-        static string[] SplitOps(string s)
+        static void SplitArgsTo(string s, List<string> dst)
         {
-            var list = new List<string>();
-            int i = 0;
-            while (i < s.Length)
-            {
-                int j = s.IndexOf(',', i);
-                if (j < 0) { list.Add(s.Substring(i).Trim()); break; }
-                list.Add(s.Substring(i, j - i).Trim());
-                i = j + 1;
-            }
-            for (int k = list.Count - 1; k >= 0; k--)
-                if (list[k].Length == 0) list.RemoveAt(k);
-            return list.ToArray();
-        }
-
-        static IEnumerable<string> SplitArgs(string s)
-        {
-            var cur = new StringBuilder();
+            dst.Clear();
+            int start = 0;
             bool inQ = false;
 
             for (int i = 0; i < s.Length; i++)
@@ -511,29 +614,44 @@ namespace IpfbTool.Core
 
                 if (!inQ && ch == ',')
                 {
-                    yield return cur.ToString().Trim();
-                    cur.Clear();
-                    continue;
+                    AddToken(dst, s, start, i - start);
+                    start = i + 1;
                 }
-
-                cur.Append(ch);
             }
 
-            var last = cur.ToString().Trim();
-            if (last.Length != 0) yield return last;
+            AddToken(dst, s, start, s.Length - start);
+
+            static void AddToken(List<string> dst, string s, int start, int len)
+            {
+                if (len <= 0) return;
+                var t = s.AsSpan(start, len).Trim();
+                if (!t.IsEmpty) dst.Add(t.ToString());
+            }
         }
 
-        static bool TryParseCmdCall(string line, out string name, out string args)
+        static string[] SplitOps(string s)
         {
-            name = "";
-            args = "";
-            int p = line.IndexOf('(');
-            if (p <= 0) return false;
-            if (!line.EndsWith(")", StringComparison.Ordinal)) return false;
+            var list = new List<string>(4);
+            int start = 0;
 
-            name = line.Substring(0, p).Trim();
-            args = line.Substring(p + 1, line.Length - p - 2);
-            return name.Length != 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] != ',') continue;
+                Add(list, s, start, i - start);
+                start = i + 1;
+            }
+
+            Add(list, s, start, s.Length - start);
+
+            if (list.Count == 0) return Array.Empty<string>();
+            return list.ToArray();
+
+            static void Add(List<string> list, string s, int start, int len)
+            {
+                if (len <= 0) return;
+                var t = s.AsSpan(start, len).Trim();
+                if (!t.IsEmpty) list.Add(t.ToString());
+            }
         }
 
         static ushort ResolveOpcode(string mnem, string[] ops)
@@ -545,10 +663,13 @@ namespace IpfbTool.Core
             if (u == "JZ") return 0x0500;
             if (u == "JNZ") return 0x0501;
 
+            static bool IsVar(string t) => t.AsSpan().TrimStart().StartsWith("@", StringComparison.Ordinal);
+            static bool IsLabel(string t) => t.AsSpan().TrimStart().StartsWith("L", StringComparison.OrdinalIgnoreCase);
+
             if (u == "JMP")
             {
                 if (ops.Length != 1) throw new FormatException("JMP needs 1 operand");
-                return ops[0].TrimStart().StartsWith("L", StringComparison.OrdinalIgnoreCase) ? (ushort)0x0403 : (ushort)0x0402;
+                return IsLabel(ops[0]) ? (ushort)0x0403 : (ushort)0x0402;
             }
 
             if (u == "PUSH")
@@ -565,10 +686,6 @@ namespace IpfbTool.Core
             if (u == "DEC") return 0x0101;
             if (u == "NOT") return 0x0200;
 
-            // 二选一：vv / vi 或 vvl / vil
-            static bool IsVar(string t) => t.TrimStart().StartsWith("@", StringComparison.Ordinal);
-            static bool IsLabel(string t) => t.TrimStart().StartsWith("L", StringComparison.OrdinalIgnoreCase);
-
             if (u == "MOV") return (ops.Length == 2 && IsVar(ops[1])) ? (ushort)0x0001 : (ushort)0x0002;
 
             if (u == "ADD") return (ops.Length == 2 && IsVar(ops[1])) ? (ushort)0x0102 : (ushort)0x0103;
@@ -577,7 +694,7 @@ namespace IpfbTool.Core
             if (u == "DIV") return (ops.Length == 2 && IsVar(ops[1])) ? (ushort)0x0108 : (ushort)0x0109;
 
             if (u == "AND") return (ops.Length == 2 && IsVar(ops[1])) ? (ushort)0x0201 : (ushort)0x0202;
-            if (u == "OR")  return (ops.Length == 2 && IsVar(ops[1])) ? (ushort)0x0203 : (ushort)0x0204;
+            if (u == "OR") return (ops.Length == 2 && IsVar(ops[1])) ? (ushort)0x0203 : (ushort)0x0204;
 
             ushort PickCmp(ushort vv, ushort vi)
             {
@@ -585,44 +702,30 @@ namespace IpfbTool.Core
                 return IsVar(ops[1]) ? vv : vi;
             }
 
-            if (u == "SETE")  return PickCmp(0x0300, 0x0301);
+            if (u == "SETE") return PickCmp(0x0300, 0x0301);
             if (u == "SETNE") return PickCmp(0x0302, 0x0303);
-            if (u == "SETG")  return PickCmp(0x0304, 0x0305);
+            if (u == "SETG") return PickCmp(0x0304, 0x0305);
             if (u == "SETGE") return PickCmp(0x0306, 0x0307);
-            if (u == "SETL")  return PickCmp(0x0308, 0x0309);
+            if (u == "SETL") return PickCmp(0x0308, 0x0309);
             if (u == "SETLE") return PickCmp(0x030A, 0x030B);
 
             ushort PickJcc(ushort vvl, ushort vil)
             {
                 if (ops.Length != 3) throw new FormatException($"{mnem} needs 3 operands");
-                if (!IsLabel(ops[2]) && !ops[2].TrimStart().StartsWith("#", StringComparison.Ordinal))
-                {
-                    // 这里第三个在我们导出格式里其实不是 L，而是 s hash（ISB里是 u32），但 Opcodes 定义里用 l/s 区分
-                    // Jcc 在表里是 l (L{u32})，所以保持 L 写法
-                }
                 return IsVar(ops[1]) ? vvl : vil;
             }
 
-            if (u == "JE")  return PickJcc(0x0502, 0x0503);
+            if (u == "JE") return PickJcc(0x0502, 0x0503);
             if (u == "JNE") return PickJcc(0x0504, 0x0505);
-            if (u == "JG")  return PickJcc(0x0506, 0x0507);
+            if (u == "JG") return PickJcc(0x0506, 0x0507);
             if (u == "JGE") return PickJcc(0x0508, 0x0509);
-            if (u == "JL")  return PickJcc(0x050A, 0x050B);
+            if (u == "JL") return PickJcc(0x050A, 0x050B);
             if (u == "JLE") return PickJcc(0x050C, 0x050D);
 
             if (NameToOpcodeBase.TryGetValue(u, out ushort direct))
                 return direct;
 
             throw new FormatException($"Unknown mnemonic: {mnem}");
-        }
-
-        static uint ParseSymbolU32(string t)
-        {
-            t = t.Trim();
-            if (t.StartsWith("#", StringComparison.Ordinal))
-                return ParseHexU32(t.Substring(1));
-
-            return Hash.MakeStrID(t);
         }
 
         static uint ParseVarU32(string t)
@@ -647,6 +750,14 @@ namespace IpfbTool.Core
             if (!t.StartsWith("L", StringComparison.OrdinalIgnoreCase))
                 throw new FormatException($"Bad label: {t}");
             return ParseU32(t.Substring(1));
+        }
+
+        static uint ParseSymbolU32(string t)
+        {
+            t = t.Trim();
+            if (t.StartsWith("#", StringComparison.Ordinal))
+                return ParseHexU32(t.Substring(1));
+            return Hash.MakeStrID(t);
         }
 
         static uint ParseHexU32(string s)
@@ -707,30 +818,21 @@ namespace IpfbTool.Core
             int even = take & ~1;
             if (even <= 0) return "";
 
-            Span<byte> swapped = even <= 2048 ? stackalloc byte[even] : new byte[even];
-            for (int i = 0; i < even; i += 2)
-            {
-                swapped[i] = dec[i + 1];
-                swapped[i + 1] = dec[i];
-            }
-
-            return Utf16BE.GetString(swapped);
+            return Encoding.Unicode.GetString(dec.Slice(0, even));
         }
 
         static string Escape(string s)
         {
-            //return s;
             if (string.IsNullOrEmpty(s)) return s;
             return s.Replace("\\", "\\\\")
                     .Replace("\"", "\\\"")
-                    .Replace("\r", "")
+                    .Replace("\r", "\\r")
                     .Replace("\n", "\\n")
                     .Replace("\0", "\\0");
         }
 
         static string Unescape(string s)
         {
-            //return s;
             if (s.IndexOf('\\') < 0) return s;
 
             var sb = new StringBuilder(s.Length);
@@ -796,8 +898,9 @@ namespace IpfbTool.Core
         static Dictionary<uint, string> BuildCmdByFileHash()
         {
             var d = new Dictionary<uint, string>(CmdNames.Length);
-            foreach (var n in CmdNames)
+            for (int i = 0; i < CmdNames.Length; i++)
             {
+                var n = CmdNames[i];
                 uint h = Hash.Filehash(n);
                 if (!d.ContainsKey(h)) d[h] = n;
             }
@@ -807,8 +910,9 @@ namespace IpfbTool.Core
         static Dictionary<uint, string> BuildCallByMakeStrId()
         {
             var d = new Dictionary<uint, string>(ScenarioNames.Length);
-            foreach (var n in ScenarioNames)
+            for (int i = 0; i < ScenarioNames.Length; i++)
             {
+                var n = ScenarioNames[i];
                 uint h = Hash.MakeStrID(n);
                 if (!d.ContainsKey(h)) d[h] = n;
             }
@@ -820,11 +924,36 @@ namespace IpfbTool.Core
             var d = new Dictionary<string, ushort>(StringComparer.OrdinalIgnoreCase);
             foreach (var kv in Opcodes)
             {
-                if (kv.Value.Fmt is null) continue;      // CMD
-                if (kv.Value.Fmt.Length != 0) continue;  // 只放“固定唯一”的到这里
+                var fmt = kv.Value.Fmt;
+                if (fmt is null) continue;
+                if (fmt.Length != 0) continue;
                 d[kv.Value.Name] = kv.Key;
             }
             return d;
+        }
+
+        static Encoding InitSjis()
+        {
+            try
+            {
+                Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+                return Encoding.GetEncoding(932);
+            }
+            catch
+            {
+                return Encoding.ASCII;
+            }
+        }
+
+        static byte[] InitEllipsis2()
+        {
+            try
+            {
+                var b = Sjis.GetBytes("…");
+                if (b.Length >= 2) return new[] { b[0], b[1] };
+            }
+            catch { }
+            return Array.Empty<byte>();
         }
     }
 }

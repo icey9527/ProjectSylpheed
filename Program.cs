@@ -139,20 +139,25 @@ namespace IpfbTool
         static void PrintHelp()
         {
             Console.WriteLine("用法:");
-            Console.WriteLine("  IpfbTool <xxx.pak> <输出目录>  (解包)");
-            Console.WriteLine("  IpfbTool <输入目录> <xxx.pak>  (打包)");
+            Console.WriteLine("  ProjectSylpheed <xxx.pak> <目录>");
+            Console.WriteLine("  ProjectSylpheed <目录> <xxx.pak>");
             Console.WriteLine();
             Console.WriteLine("可选参数:");
-            Console.WriteLine("  --xform=all|none|名单");
-            Console.WriteLine("  --xform all|none|名单");
-            Console.WriteLine("  -x all|none|名单");
-            Console.WriteLine("  --list-xform");
+            Console.WriteLine("  --xform=<spec>");
+            Console.WriteLine("  --xform <spec>");
+            Console.WriteLine("  -x <spec>");
             Console.WriteLine();
-            Console.WriteLine("名单格式:");
-            Console.WriteLine("  TBLR");
-            Console.WriteLine("  TBLR,ISB");
-            Console.WriteLine("  all,-TBLR");
+            Console.WriteLine("<spec> 规则:");
+            Console.WriteLine("  all              启用全部转换器（默认）");
+            Console.WriteLine("  none             禁用全部转换器");
+            Console.WriteLine("  A,B,C            只启用这些转换器");
+            Console.WriteLine("  all,-A,-B        从 all 中排除");
+            Console.WriteLine("  -A,-B            等价于 all,-A,-B");
             Console.WriteLine();
+            Console.WriteLine("示例:");
+            Console.WriteLine("  ProjectSylpheed out game.pak --xform=none");
+            Console.WriteLine("  ProjectSylpheed out game.pak --xform=ISB,FNT,PRT");
+            Console.WriteLine("  ProjectSylpheed out game.pak --xform=all,-T32,-TBM");
             PrintTransformers();
         }
     }

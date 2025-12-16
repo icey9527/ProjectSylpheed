@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
@@ -51,83 +50,108 @@ namespace IpfbTool.Core
                 _ => throw new InvalidDataException($"TBM: unsupported color_bits {h.ColorBits}")
             };
 
-            if (d.Length < 0x34 + (int)h.NumTextures * 4)
+            int nt = checked((int)h.NumTextures);
+            if (d.Length < 0x34 + nt * 4)
                 throw new InvalidDataException("TBM: truncated");
 
             int pos = 0x34;
 
-            var offsets = new int[h.NumTextures];
-            for (int i = 0; i < offsets.Length; i++)
+            int[] offsets = new int[nt];
+            for (int i = 0; i < nt; i++)
             {
                 offsets[i] = unchecked((int)TextureUtil.ReadU32BE(d, pos));
                 pos += 4;
             }
 
-            pos += unchecked((int)h.NumPalettes) * 4;
+            pos = checked(pos + checked((int)h.NumPalettes) * 4);
 
             var img = new Image<Rgba32>(h.W, h.H);
 
+            int[] sxArr = new int[nt];
+            int[] syArr = new int[nt];
+            int[] dxArr = new int[nt];
+            int[] dyArr = new int[nt];
+            int[] wArr = new int[nt];
+            int[] hArr = new int[nt];
+            int[] pitchArr = new int[nt];
+            int[] startArr = new int[nt];
+
+            int imgW = img.Width, imgH = img.Height;
+
+            for (int i = 0; i < nt; i++)
+            {
+                int ofs = offsets[i];
+                if ((uint)ofs > (uint)(d.Length - 0x10)) { startArr[i] = -1; continue; }
+
+                int ptX = TextureUtil.ReadI32BE(d, ofs + 0x00);
+                int ptY = TextureUtil.ReadI32BE(d, ofs + 0x04);
+                int w = TextureUtil.ReadI32BE(d, ofs + 0x08);
+                int hh = TextureUtil.ReadI32BE(d, ofs + 0x0C);
+                if (w <= 0 || hh <= 0) { startArr[i] = -1; continue; }
+
+                int pitch = ((checked(w * bpp)) + 3) & ~3;
+                int pixBase = checked(ofs + 0x10);
+
+                long need = (long)pixBase + (long)pitch * hh;
+                if ((uint)pixBase > (uint)d.Length || need > d.Length) { startArr[i] = -1; continue; }
+
+                int dx = ptX, dy = ptY;
+                int sx = 0, sy = 0;
+                int cw = w, ch = hh;
+
+                if (dx < 0) { sx = -dx; cw += dx; dx = 0; }
+                if (dy < 0) { sy = -dy; ch += dy; dy = 0; }
+
+                if (dx >= imgW || dy >= imgH) { startArr[i] = -1; continue; }
+
+                if (dx + cw > imgW) cw = imgW - dx;
+                if (dy + ch > imgH) ch = imgH - dy;
+                if (cw <= 0 || ch <= 0) { startArr[i] = -1; continue; }
+
+                sxArr[i] = sx;
+                syArr[i] = sy;
+                dxArr[i] = dx;
+                dyArr[i] = dy;
+                wArr[i] = cw;
+                hArr[i] = ch;
+                pitchArr[i] = pitch;
+                startArr[i] = pixBase;
+            }
+
             img.ProcessPixelRows(accessor =>
             {
-                for (int i = 0; i < offsets.Length; i++)
+                for (int i = 0; i < nt; i++)
                 {
-                    int ofs = offsets[i];
-                    if (ofs < 0 || ofs + 0x10 > d.Length) continue;
+                    int start = startArr[i];
+                    if (start < 0) continue;
 
-                    int ptX = TextureUtil.ReadI32BE(d, ofs + 0x00);
-                    int ptY = TextureUtil.ReadI32BE(d, ofs + 0x04);
-                    int w = TextureUtil.ReadI32BE(d, ofs + 0x08);
-                    int hh = TextureUtil.ReadI32BE(d, ofs + 0x0C);
-                    if (w <= 0 || hh <= 0) continue;
+                    int sx = sxArr[i], sy = syArr[i];
+                    int dx = dxArr[i], dy = dyArr[i];
+                    int cw = wArr[i], ch = hArr[i];
+                    int pitch = pitchArr[i];
 
-                    int pitch = ((w * bpp) + 3) & ~3;
-                    int pixBase = ofs + 0x10;
-
-                    for (int y = 0; y < hh; y++)
+                    if (bpp == 3)
                     {
-                        int dy = ptY + y;
-                        if ((uint)dy >= (uint)img.Height) continue;
-
-                        int rowBase = pixBase + y * pitch;
-                        if (rowBase < 0 || rowBase >= d.Length) break;
-
-                        var row = accessor.GetRowSpan(dy);
-                        int maxX = Math.Min(w, img.Width - ptX);
-                        if (maxX <= 0) continue;
-
-                        int x0 = ptX;
-                        int base0 = rowBase;
-
-                        if (x0 < 0)
+                        for (int y = 0; y < ch; y++)
                         {
-                            int skip = -x0;
-                            if (skip >= w) continue;
-                            base0 += skip * bpp;
-                            maxX = Math.Min(w - skip, img.Width);
-                            x0 = 0;
+                            Span<Rgba32> dst = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            int rowBase = start + (sy + y) * pitch + sx * 3;
+                            ReadOnlySpan<byte> src = d.AsSpan(rowBase, cw * 3);
+
+                            for (int x = 0, p = 0; x < cw; x++, p += 3)
+                                dst[x] = new Rgba32(src[p + 2], src[p + 1], src[p + 0], 255);
                         }
-
-                        var dst = row.Slice(x0, maxX);
-
-                        if (bpp == 3)
+                    }
+                    else
+                    {
+                        for (int y = 0; y < ch; y++)
                         {
-                            for (int x = 0; x < maxX; x++)
-                            {
-                                int p = base0 + x * 3;
-                                if (p + 2 >= d.Length) break;
-                                byte b = d[p], g = d[p + 1], r = d[p + 2];
-                                dst[x] = new Rgba32(r, g, b, 255);
-                            }
-                        }
-                        else
-                        {
-                            for (int x = 0; x < maxX; x++)
-                            {
-                                int p = base0 + x * 4;
-                                if (p + 3 >= d.Length) break;
-                                byte b = d[p], g = d[p + 1], r = d[p + 2], a = d[p + 3];
-                                dst[x] = new Rgba32(r, g, b, a);
-                            }
+                            Span<Rgba32> dst = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            int rowBase = start + (sy + y) * pitch + sx * 4;
+                            ReadOnlySpan<byte> src = d.AsSpan(rowBase, cw * 4);
+
+                            for (int x = 0, p = 0; x < cw; x++, p += 4)
+                                dst[x] = new Rgba32(src[p + 2], src[p + 1], src[p + 0], src[p + 3]);
                         }
                     }
                 }
@@ -150,27 +174,36 @@ namespace IpfbTool.Core
             const int tile = 256;
             int cols = (width + tile - 1) / tile, rows = (height + tile - 1) / tile;
 
-            var blocks = new List<(int X, int Y, int W, int H, int Pitch, int Offset)>(cols * rows);
+            int parts = checked(cols * rows);
 
             int headerSize = 0x34;
-            int offsetTableSize = cols * rows * 4;
-            int paletteTableSize = unchecked((int)numPalettes) * 4;
+            int offsetTableSize = checked(parts * 4);
+            int paletteTableSize = checked(unchecked((int)numPalettes) * 4);
+            int dataBase = checked(headerSize + offsetTableSize + paletteTableSize);
 
-            int ofs = headerSize + offsetTableSize + paletteTableSize;
+            int[] blockOfs = new int[parts];
+            int[] blockPitch = new int[parts];
+            int[] blockW = new int[parts];
+            int[] blockH = new int[parts];
 
-            for (int iy = 0; iy < rows; iy++)
-            for (int ix = 0; ix < cols; ix++)
+            int ofs = dataBase;
+
+            for (int iy = 0, i = 0; iy < rows; iy++)
+            for (int ix = 0; ix < cols; ix++, i++)
             {
-                int x = ix * tile, y = iy * tile;
-                int w = Math.Min(tile, width - x), h = Math.Min(tile, height - y);
-                if (w <= 0 || h <= 0) continue;
+                int bx = ix * tile, by = iy * tile;
+                int w = Math.Min(tile, width - bx), h = Math.Min(tile, height - by);
+                if (w <= 0 || h <= 0) { blockOfs[i] = ofs; blockPitch[i] = 0; blockW[i] = 0; blockH[i] = 0; continue; }
 
-                int pitch = ((w * bpp) + 3) & ~3;
-                blocks.Add((x, y, w, h, pitch, ofs));
-                ofs += 0x10 + pitch * h;
+                int pitch = ((checked(w * bpp)) + 3) & ~3;
+                blockOfs[i] = ofs;
+                blockPitch[i] = pitch;
+                blockW[i] = w;
+                blockH[i] = h;
+                ofs = checked(ofs + 0x10 + pitch * h);
             }
 
-            var result = new byte[ofs];
+            byte[] result = new byte[ofs];
 
             TextureUtil.WriteU32BE(result, 0x00, tag);
             TextureUtil.WriteU32BE(result, 0x04, status);
@@ -179,7 +212,7 @@ namespace IpfbTool.Core
             TextureUtil.WriteI32BE(result, 0x10, posY);
             TextureUtil.WriteI32BE(result, 0x14, width);
             TextureUtil.WriteI32BE(result, 0x18, height);
-            TextureUtil.WriteU32BE(result, 0x1C, (uint)blocks.Count);
+            TextureUtil.WriteU32BE(result, 0x1C, unchecked((uint)parts));
             TextureUtil.WriteU32BE(result, 0x20, colorBits);
             TextureUtil.WriteU32BE(result, 0x24, numPalettes);
             TextureUtil.WriteU32BE(result, 0x28, placement);
@@ -187,49 +220,62 @@ namespace IpfbTool.Core
             TextureUtil.WriteI32BE(result, 0x30, stdH);
 
             int pos = 0x34;
-            for (int i = 0; i < blocks.Count; i++)
+            for (int i = 0; i < parts; i++)
             {
-                TextureUtil.WriteU32BE(result, pos, unchecked((uint)blocks[i].Offset));
+                TextureUtil.WriteU32BE(result, pos, unchecked((uint)blockOfs[i]));
                 pos += 4;
             }
 
+            for (int i = 0; i < paletteTableSize; i++)
+                result[headerSize + offsetTableSize + i] = 0;
+
             img.ProcessPixelRows(accessor =>
             {
-                foreach (var b in blocks)
+                for (int iy = 0, i = 0; iy < rows; iy++)
+                for (int ix = 0; ix < cols; ix++, i++)
                 {
-                    TextureUtil.WriteI32BE(result, b.Offset + 0x00, b.X);
-                    TextureUtil.WriteI32BE(result, b.Offset + 0x04, b.Y);
-                    TextureUtil.WriteI32BE(result, b.Offset + 0x08, b.W);
-                    TextureUtil.WriteI32BE(result, b.Offset + 0x0C, b.H);
+                    int w = blockW[i], h = blockH[i];
+                    if (w <= 0 || h <= 0) continue;
 
-                    int basePix = b.Offset + 0x10;
+                    int bx = ix * tile, by = iy * tile;
+                    int bo = blockOfs[i];
+                    int pitch = blockPitch[i];
 
-                    for (int y = 0; y < b.H; y++)
+                    TextureUtil.WriteI32BE(result, bo + 0x00, bx);
+                    TextureUtil.WriteI32BE(result, bo + 0x04, by);
+                    TextureUtil.WriteI32BE(result, bo + 0x08, w);
+                    TextureUtil.WriteI32BE(result, bo + 0x0C, h);
+
+                    int basePix = bo + 0x10;
+
+                    if (bpp == 3)
                     {
-                        var srcRow = accessor.GetRowSpan(b.Y + y).Slice(b.X, b.W);
-                        int rowBase = basePix + y * b.Pitch;
-
-                        if (bpp == 3)
+                        for (int y = 0; y < h; y++)
                         {
-                            for (int x = 0; x < b.W; x++)
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(basePix + y * pitch, w * 3);
+                            for (int x = 0, p = 0; x < w; x++, p += 3)
                             {
-                                int p = rowBase + x * 3;
                                 var px = srcRow[x];
-                                result[p + 0] = px.B;
-                                result[p + 1] = px.G;
-                                result[p + 2] = px.R;
+                                outRow[p + 0] = px.B;
+                                outRow[p + 1] = px.G;
+                                outRow[p + 2] = px.R;
                             }
                         }
-                        else
+                    }
+                    else
+                    {
+                        for (int y = 0; y < h; y++)
                         {
-                            for (int x = 0; x < b.W; x++)
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(basePix + y * pitch, w * 4);
+                            for (int x = 0, p = 0; x < w; x++, p += 4)
                             {
-                                int p = rowBase + x * 4;
                                 var px = srcRow[x];
-                                result[p + 0] = px.B;
-                                result[p + 1] = px.G;
-                                result[p + 2] = px.R;
-                                result[p + 3] = px.A;
+                                outRow[p + 0] = px.B;
+                                outRow[p + 1] = px.G;
+                                outRow[p + 2] = px.R;
+                                outRow[p + 3] = px.A;
                             }
                         }
                     }

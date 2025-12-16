@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 
@@ -17,7 +18,12 @@ namespace IpfbTool.Core
         };
 
         static readonly Dictionary<string, ITransformer> map = BuildMap();
-        static HashSet<string> enabled = new(map.Keys, StringComparer.OrdinalIgnoreCase);
+
+        static volatile HashSet<string> enabled = new(map.Keys, StringComparer.OrdinalIgnoreCase);
+        static int enabledVersion;
+
+        static readonly ConcurrentDictionary<string, (int version, ITransformer? t)> packCache =
+            new(StringComparer.OrdinalIgnoreCase);
 
         static Dictionary<string, ITransformer> BuildMap()
         {
@@ -26,20 +32,33 @@ namespace IpfbTool.Core
             return d;
         }
 
-        public static IReadOnlyList<string> Available => Array.ConvertAll(list, t => t.GetType().Name);
+        public static IReadOnlyList<string> Available
+        {
+            get
+            {
+                var a = new string[list.Length];
+                for (int i = 0; i < list.Length; i++) a[i] = list[i].GetType().Name;
+                return a;
+            }
+        }
 
         public static bool TryConfigure(string spec, out string error)
         {
             error = "";
+
+            HashSet<string> set;
+
             if (string.IsNullOrWhiteSpace(spec) || spec.Equals("all", StringComparison.OrdinalIgnoreCase))
             {
-                enabled = new HashSet<string>(map.Keys, StringComparer.OrdinalIgnoreCase);
+                set = new HashSet<string>(map.Keys, StringComparer.OrdinalIgnoreCase);
+                ApplyEnabled(set);
                 return true;
             }
 
             if (spec.Equals("none", StringComparison.OrdinalIgnoreCase) || spec.Equals("off", StringComparison.OrdinalIgnoreCase))
             {
-                enabled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                ApplyEnabled(set);
                 return true;
             }
 
@@ -50,33 +69,37 @@ namespace IpfbTool.Core
                 return false;
             }
 
-            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             bool baseAll = false;
 
             if (tokens.Count > 0)
             {
-                if (tokens[0].Equals("all", StringComparison.OrdinalIgnoreCase))
+                var first = tokens[0];
+                if (first.Equals("all", StringComparison.OrdinalIgnoreCase))
                 {
                     baseAll = true;
                     tokens.RemoveAt(0);
                 }
-                else if (tokens[0].Equals("none", StringComparison.OrdinalIgnoreCase))
+                else if (first.Equals("none", StringComparison.OrdinalIgnoreCase))
                 {
                     baseAll = false;
                     tokens.RemoveAt(0);
                 }
                 else
                 {
-                    foreach (var t in tokens)
-                        if (t.Length > 0 && (t[0] == '-' || t[0] == '!'))
-                            baseAll = true;
+                    for (int i = 0; i < tokens.Count; i++)
+                    {
+                        var t = tokens[i];
+                        if (t.Length > 0 && (t[0] == '-' || t[0] == '!')) { baseAll = true; break; }
+                    }
                 }
             }
 
             if (baseAll) set.UnionWith(map.Keys);
 
-            foreach (var raw in tokens)
+            for (int i = 0; i < tokens.Count; i++)
             {
+                var raw = tokens[i];
                 if (string.IsNullOrWhiteSpace(raw)) continue;
 
                 bool remove = raw[0] == '-' || raw[0] == '!';
@@ -92,37 +115,56 @@ namespace IpfbTool.Core
                 else set.Add(name);
             }
 
-            enabled = set;
+            ApplyEnabled(set);
             return true;
+        }
+
+        static void ApplyEnabled(HashSet<string> set)
+        {
+            enabled = set;
+            System.Threading.Interlocked.Increment(ref enabledVersion);
+            packCache.Clear();
         }
 
         static List<string> SplitTokens(string spec)
         {
             var r = new List<string>();
-            foreach (var p in spec.Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
-                r.Add(p.Trim());
+            int i = 0;
+            while (i < spec.Length)
+            {
+                while (i < spec.Length && IsSep(spec[i])) i++;
+                if (i >= spec.Length) break;
+
+                int j = i;
+                while (j < spec.Length && !IsSep(spec[j])) j++;
+
+                var tok = spec.AsSpan(i, j - i).Trim();
+                if (!tok.IsEmpty) r.Add(tok.ToString());
+
+                i = j;
+            }
             return r;
+
+            static bool IsSep(char c) => c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\r' || c == '\n';
         }
 
-        static bool IsEnabled(ITransformer t) => enabled.Contains(t.GetType().Name);
+        static bool IsEnabled(ITransformer t)
+        {
+            var e = enabled;
+            return e.Contains(t.GetType().Name);
+        }
 
         internal static bool TryGetPackTransformer(string name, out ITransformer transformer)
         {
-            foreach (var t in list)
-            {
-                if (!t.CanPack) continue;
-                if (!IsEnabled(t) || !t.CanTransformOnPack(name)) continue;
-                transformer = t;
-                return true;
-            }
-            transformer = null!;
-            return false;
+            transformer = ResolvePackTransformer(name);
+            return transformer != null;
         }
 
         public static (string name, string path) ProcessExtract(string name, string outPath, byte[] data, Manifest manifest)
         {
-            foreach (var t in list)
+            for (int i = 0; i < list.Length; i++)
             {
+                var t = list[i];
                 if (!t.CanExtract) continue;
                 if (!IsEnabled(t) || !t.CanTransformOnExtract(name)) continue;
 
@@ -145,13 +187,51 @@ namespace IpfbTool.Core
 
         public static (string name, byte[] data) ProcessPack(string name, string srcPath)
         {
-            foreach (var t in list)
+            var t = ResolvePackTransformer(name);
+            if (t != null)
+                return t.OnPack(srcPath, name);
+
+            return (name, File.ReadAllBytes(srcPath));
+        }
+
+        static ITransformer? ResolvePackTransformer(string name)
+        {
+            int v = enabledVersion;
+            string key = CacheKey(name);
+
+            if (packCache.TryGetValue(key, out var hit) && hit.version == v)
             {
+                var ht = hit.t;
+                if (ht == null) return null;
+                if (!IsEnabled(ht) || !ht.CanPack || !ht.CanTransformOnPack(name)) return null;
+                return ht;
+            }
+
+            ITransformer? found = null;
+
+            for (int i = 0; i < list.Length; i++)
+            {
+                var t = list[i];
                 if (!t.CanPack) continue;
                 if (!IsEnabled(t) || !t.CanTransformOnPack(name)) continue;
-                return t.OnPack(srcPath, name);
+                found = t;
+                break;
             }
-            return (name, File.ReadAllBytes(srcPath));
+
+            packCache[key] = (v, found);
+            return found;
+        }
+
+        static string CacheKey(string name)
+        {
+            string ext = Path.GetExtension(name);
+            if (!string.IsNullOrEmpty(ext))
+                return ext;
+
+            int slash = name.LastIndexOfAny(new[] { '/', '\\' });
+            if (slash >= 0) name = name[(slash + 1)..];
+
+            return name;
         }
     }
 }

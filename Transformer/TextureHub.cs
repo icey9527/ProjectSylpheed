@@ -1,5 +1,4 @@
 using System;
-using System.Text;
 
 namespace IpfbTool.Core
 {
@@ -9,6 +8,19 @@ namespace IpfbTool.Core
         static readonly uint TBMB = TextureUtil.FourCC("TBMB");
         static readonly uint TBMC = TextureUtil.FourCC("TBMC");
         static readonly uint TBMD = TextureUtil.FourCC("TBMD");
+
+        static readonly uint T8aD = TextureUtil.FourCC("T8aD");
+        static readonly uint T8aB = TextureUtil.FourCC("T8aB");
+        static readonly uint T8aC = TextureUtil.FourCC("T8aC");
+        static readonly uint T32_ = TextureUtil.FourCC("T32 ");
+        static readonly uint T4aD = TextureUtil.FourCC("T4aD");
+        static readonly uint T4aB = TextureUtil.FourCC("T4aB");
+        static readonly uint T4aC = TextureUtil.FourCC("T4aC");
+        static readonly uint T1aD = TextureUtil.FourCC("T1aD");
+        static readonly uint T1aB = TextureUtil.FourCC("T1aB");
+        static readonly uint T1aC = TextureUtil.FourCC("T1aC");
+        static readonly uint _4444 = TextureUtil.FourCC("4444");
+        static readonly uint _1555 = TextureUtil.FourCC("1555");
 
         public static bool TryExtractAndRecord(byte[] payload, uint id, string logicalName, string type, string pngRel,
             Manifest manifest, out string tex, out byte[] png)
@@ -36,17 +48,9 @@ namespace IpfbTool.Core
             return false;
         }
 
-        static bool IsT32(uint tag)
-        {
-            string m = Encoding.ASCII.GetString(new[]
-            {
-                (byte)(tag >> 24), (byte)(tag >> 16), (byte)(tag >> 8), (byte)tag
-            });
-
-            return m is "T8aD" or "T8aB" or "T8aC" or "T32 " or
-                     "T4aD" or "T4aB" or "T4aC" or
-                     "T1aD" or "T1aB" or "T1aC" or
-                     "4444" or "1555";
-        }
+        static bool IsT32(uint tag) => tag == T8aD || tag == T8aB || tag == T8aC || tag == T32_ ||
+                                      tag == T4aD || tag == T4aB || tag == T4aC ||
+                                      tag == T1aD || tag == T1aB || tag == T1aC ||
+                                      tag == _4444 || tag == _1555;
     }
 }

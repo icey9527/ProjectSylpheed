@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Text;
 
@@ -7,23 +8,38 @@ namespace IpfbTool.Core
 {
     internal sealed class TBL : ITransformer
     {
-        static TBL()
-        {
-            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
-        }
-
-        static readonly Encoding CP932 = Encoding.GetEncoding(932);
+        static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+        static readonly Encoding CP932 = Init932();
         static readonly Encoding UTF16BE = Encoding.BigEndianUnicode;
 
-        static bool IsTarget(string name)
+        static Encoding Init932()
         {
-            var ext = Path.GetExtension(name);
-            return ext.Equals(".tbl", StringComparison.OrdinalIgnoreCase)
-                || ext.Equals(".IDXD", StringComparison.OrdinalIgnoreCase)
-                || ext.Equals(".IXUD", StringComparison.OrdinalIgnoreCase);
+            try
+            {
+                Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+                return Encoding.GetEncoding(932);
+            }
+            catch
+            {
+                return Encoding.ASCII;
+            }
         }
 
-        public bool CanTransformOnExtract(string name) => IsTarget(name);
+        static bool IsTbl(string name) =>
+            Path.GetExtension(name).Equals(".tbl", StringComparison.OrdinalIgnoreCase);
+
+        static bool IsIdx(string name) =>
+            Path.GetExtension(name).Equals(".idx", StringComparison.OrdinalIgnoreCase);
+
+        static bool IsIxu(string name) =>
+            Path.GetExtension(name).Equals(".ixu", StringComparison.OrdinalIgnoreCase);
+
+        public bool CanExtract => true;
+        public bool CanPack => true;
+
+        public bool CanTransformOnExtract(string name) => IsTbl(name);
+
+        public bool CanTransformOnPack(string name) => IsIdx(name) || IsIxu(name);
 
         public (string name, byte[] data) OnExtract(byte[] srcData, string srcName, Manifest manifest)
         {
@@ -38,89 +54,94 @@ namespace IpfbTool.Core
             var enc = isUtf16 ? UTF16BE : CP932;
             int ptrMul = isUtf16 ? 2 : 1;
 
-            using var ms = new MemoryStream(srcData, false);
-            using var br = new BinaryReader(ms);
+            int pos = 4;
 
-            ms.Position = 4;
+            if (!TryReadI32BE(srcData, ref pos, out int sectionCount)) return (srcName, srcData);
+            if (sectionCount < 0 || sectionCount > 1_000_000) return (srcName, srcData);
 
-            int sectionCount = BeBinary.ReadInt32(br);
             var sections = new (int namePtr, int startIdx, int endIdx)[sectionCount];
             for (int i = 0; i < sectionCount; i++)
             {
-                BeBinary.ReadInt32(br);
-                sections[i] = (BeBinary.ReadInt32(br), BeBinary.ReadInt32(br), BeBinary.ReadInt32(br));
+                if (!TrySkip(srcData, ref pos, 4)) return (srcName, srcData);
+                if (!TryReadI32BE(srcData, ref pos, out int namePtr)) return (srcName, srcData);
+                if (!TryReadI32BE(srcData, ref pos, out int startIdx)) return (srcName, srcData);
+                if (!TryReadI32BE(srcData, ref pos, out int endIdx)) return (srcName, srcData);
+                sections[i] = (namePtr, startIdx, endIdx);
             }
 
-            int kvCount = BeBinary.ReadInt32(br);
+            if (!TryReadI32BE(srcData, ref pos, out int kvCount)) return (srcName, srcData);
+            if (kvCount < 0 || kvCount > 5_000_000) return (srcName, srcData);
+
             var kvs = new (int key, int keyPtr, int valuePtr)[kvCount];
             for (int i = 0; i < kvCount; i++)
-                kvs[i] = (BeBinary.ReadInt32(br), BeBinary.ReadInt32(br), BeBinary.ReadInt32(br));
-
-            BeBinary.ReadInt32(br);
-            long strBase = ms.Position;
-
-            string GetStr(int ptr) => ptr < 0 ? "" : ReadString(ms, strBase + (long)ptr * ptrMul, enc, isUtf16);
-
-            var sb = new StringBuilder();
-            foreach (var (namePtr, startIdx, endIdx) in sections)
             {
-                sb.Append('[').Append(GetStr(namePtr)).Append("]\r\n");
+                if (!TryReadI32BE(srcData, ref pos, out int key)) return (srcName, srcData);
+                if (!TryReadI32BE(srcData, ref pos, out int keyPtr)) return (srcName, srcData);
+                if (!TryReadI32BE(srcData, ref pos, out int valuePtr)) return (srcName, srcData);
+                kvs[i] = (key, keyPtr, valuePtr);
+            }
 
-                int end = endIdx < kvCount ? endIdx : kvCount;
-                for (int i = startIdx; i < end; i++)
+            if (!TryReadI32BE(srcData, ref pos, out _)) return (srcName, srcData);
+            int strBase = pos;
+
+            string GetStr(int ptr)
+            {
+                if (ptr < 0) return "";
+                long offL = (long)strBase + (long)ptr * ptrMul;
+                if (offL < 0 || offL > int.MaxValue) return "";
+                int off = (int)offL;
+                if ((uint)off >= (uint)srcData.Length) return "";
+                return ReadStringFromSpan(srcData, off, enc, isUtf16);
+            }
+
+            var sb = new StringBuilder(srcData.Length / 2);
+
+            for (int si = 0; si < sections.Length; si++)
+            {
+                var (namePtr, startIdx, endIdx) = sections[si];
+                sb.Append('[').Append(GetStr(namePtr)).Append("]\n");
+
+                int start = startIdx < 0 ? 0 : startIdx;
+                int end = endIdx < 0 ? 0 : endIdx;
+                if (end > kvCount) end = kvCount;
+
+                for (int i = start; i < end; i++)
                 {
                     var (key, keyPtr, valuePtr) = kvs[i];
                     var value = GetStr(valuePtr);
 
                     if (keyPtr == -1)
-                        sb.Append('#').AppendFormat("{0:X8}", key).Append('=').Append(value).Append("\r\n");
+                        sb.Append('#').Append(key.ToString("X8", CultureInfo.InvariantCulture)).Append('=').Append(value).Append('\n');
                     else
-                        sb.Append(GetStr(keyPtr)).Append('=').Append(value).Append("\r\n");
+                        sb.Append(GetStr(keyPtr)).Append('=').Append(value).Append('\n');
                 }
 
-                sb.Append("\r\n");
+                sb.Append('\n');
             }
 
-            var text = sb.ToString();
-            if (!isUtf16) return (srcName, enc.GetBytes(text));
-
-            var body = enc.GetBytes(text);
-            var result = new byte[2 + body.Length];
-            result[0] = 0xFE;
-            result[1] = 0xFF;
-            Buffer.BlockCopy(body, 0, result, 2, body.Length);
-            return (srcName, result);
+            return (Path.ChangeExtension(srcName, isUtf16 ? ".ixu" : ".idx"), Utf8NoBom.GetBytes(sb.ToString()));
         }
-
-        public bool CanTransformOnPack(string name) => IsTarget(name);
 
         public (string name, byte[] data) OnPack(string srcPath, string srcName)
         {
-            var raw = File.ReadAllBytes(srcPath);
+            byte[] raw = File.ReadAllBytes(srcPath);
 
-            if (raw.Length >= 4)
-            {
-                var h = raw.AsSpan(0, 4);
-                if (h.SequenceEqual("IDXD"u8) || h.SequenceEqual("IXUD"u8))
-                    return (srcName, raw);
-            }
-
-            bool isUtf16 = raw.Length >= 2 && raw[0] == 0xFE && raw[1] == 0xFF;
+            bool isUtf16 = IsIxu(srcName) || srcPath.EndsWith(".ixu", StringComparison.OrdinalIgnoreCase);
             var enc = isUtf16 ? UTF16BE : CP932;
             int ptrMul = isUtf16 ? 2 : 1;
 
             int HashOf(string s) => isUtf16 ? Hash.UTF16BEhash(s) : Hash.JIShash(s);
 
-            var sections = new List<(string name, int start, int end)>();
-            var kvs = new List<(int? numKey, string strKey, string value)>();
+            var sections = new List<(string name, int start, int end)>(64);
+            var kvs = new List<(int? numKey, string? strKey, string value)>(4096);
 
             using (var ms = new MemoryStream(raw))
-            using (var sr = new StreamReader(ms, enc, true))
+            using (var sr = new StreamReader(ms, Utf8NoBom, detectEncodingFromByteOrderMarks: true))
             {
-                string section = null;
+                string? section = null;
                 int start = 0;
 
-                string line;
+                string? line;
                 while ((line = sr.ReadLine()) != null)
                 {
                     if (line.Length == 0) continue;
@@ -146,7 +167,8 @@ namespace IpfbTool.Core
                     var keyPart = line[..eq];
                     var valPart = line[(eq + 1)..];
 
-                    if (keyPart.Length > 0 && keyPart[0] == '#' && int.TryParse(keyPart[1..], System.Globalization.NumberStyles.HexNumber, null, out int numKey))
+                    if (keyPart.Length > 0 && keyPart[0] == '#' &&
+                        int.TryParse(keyPart.AsSpan(1), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out int numKey))
                         kvs.Add((numKey, null, valPart));
                     else
                         kvs.Add((null, keyPart, valPart));
@@ -155,11 +177,11 @@ namespace IpfbTool.Core
                 if (section != null) sections.Add((section, start, kvs.Count));
             }
 
-            using var strPool = new MemoryStream();
+            using var strPool = new MemoryStream(raw.Length / 4);
             var strPtrs = new Dictionary<string, int>(StringComparer.Ordinal);
             int emptyPtr = -1;
 
-            int AddString(string s)
+            int AddString(string? s)
             {
                 s ??= "";
 
@@ -197,17 +219,18 @@ namespace IpfbTool.Core
                 var kv = kvs[i];
                 kvsBin[i] = kv.numKey.HasValue
                     ? (kv.numKey.Value, -1, AddString(kv.value))
-                    : (HashOf(kv.strKey), AddString(kv.strKey), AddString(kv.value));
+                    : (HashOf(kv.strKey ?? ""), AddString(kv.strKey), AddString(kv.value));
             }
 
-            using var ms2 = new MemoryStream();
+            using var ms2 = new MemoryStream(raw.Length);
             using var bw = new BinaryWriter(ms2);
 
             bw.Write(isUtf16 ? "IXUD"u8 : "IDXD"u8);
 
             BeBinary.WriteInt32(bw, sectionsBin.Length);
-            foreach (var (hash, namePtr, startIdx, endIdx) in sectionsBin)
+            for (int i = 0; i < sectionsBin.Length; i++)
             {
+                var (hash, namePtr, startIdx, endIdx) = sectionsBin[i];
                 BeBinary.WriteInt32(bw, hash);
                 BeBinary.WriteInt32(bw, namePtr);
                 BeBinary.WriteInt32(bw, startIdx);
@@ -215,45 +238,60 @@ namespace IpfbTool.Core
             }
 
             BeBinary.WriteInt32(bw, kvsBin.Length);
-            foreach (var (key, keyPtr, valuePtr) in kvsBin)
+            for (int i = 0; i < kvsBin.Length; i++)
             {
+                var (key, keyPtr, valuePtr) = kvsBin[i];
                 BeBinary.WriteInt32(bw, key);
                 BeBinary.WriteInt32(bw, keyPtr);
                 BeBinary.WriteInt32(bw, valuePtr);
             }
 
             BeBinary.WriteInt32(bw, checked((int)(strPool.Length / ptrMul)));
-            if (strPool.TryGetBuffer(out var seg))
+
+            if (strPool.TryGetBuffer(out var seg) && seg.Array != null)
                 bw.Write(seg.Array, seg.Offset, seg.Count);
             else
                 bw.Write(strPool.ToArray());
 
-            return (srcName, ms2.ToArray());
+            return (Path.ChangeExtension(srcName, ".tbl"), ms2.ToArray());
         }
 
-        static string ReadString(Stream s, long off, Encoding enc, bool isUtf16)
+        static bool TryReadI32BE(byte[] d, ref int pos, out int v)
         {
-            long p = s.Position;
-            s.Position = off;
+            if ((uint)(pos + 4) > (uint)d.Length) { v = 0; return false; }
+            v = BeBinary.ReadInt32(d, pos);
+            pos += 4;
+            return true;
+        }
 
-            var buf = new List<byte>(64);
-            if (isUtf16)
+        static bool TrySkip(byte[] d, ref int pos, int n)
+        {
+            if (n < 0) return false;
+            if ((uint)(pos + n) > (uint)d.Length) return false;
+            pos += n;
+            return true;
+        }
+
+        static string ReadStringFromSpan(byte[] data, int off, Encoding enc, bool isUtf16)
+        {
+            if (!isUtf16)
             {
-                int a, b;
-                while ((a = s.ReadByte()) >= 0 && (b = s.ReadByte()) >= 0 && (a | b) != 0)
-                {
-                    buf.Add((byte)a);
-                    buf.Add((byte)b);
-                }
+                int i = off;
+                while ((uint)i < (uint)data.Length && data[i] != 0) i++;
+                int len = i - off;
+                return len <= 0 ? "" : enc.GetString(data, off, len);
             }
             else
             {
-                int b;
-                while ((b = s.ReadByte()) > 0) buf.Add((byte)b);
+                int i = off;
+                while ((uint)(i + 1) < (uint)data.Length)
+                {
+                    if ((data[i] | data[i + 1]) == 0) break;
+                    i += 2;
+                }
+                int len = i - off;
+                return len <= 0 ? "" : enc.GetString(data, off, len);
             }
-
-            s.Position = p;
-            return buf.Count == 0 ? "" : enc.GetString(buf.ToArray());
         }
     }
 }

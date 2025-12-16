@@ -1,30 +1,32 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Text;
 
 namespace IpfbTool.Core
 {
     internal sealed class FNT : ITransformer
     {
-        static readonly byte[] Magic = "LSTA"u8.ToArray();
+        static ReadOnlySpan<byte> Magic => "LSTA"u8;
         const int EntryHeaderSize = 15;
 
         public bool CanPack => false;
 
-        public bool CanTransformOnExtract(string name) =>
-            Path.GetExtension(name).Equals(".FNT", StringComparison.OrdinalIgnoreCase) ||
-            Path.GetExtension(name).Equals(".LSTA", StringComparison.OrdinalIgnoreCase);
+        public bool CanTransformOnExtract(string name)
+        {
+            string ext = Path.GetExtension(name);
+            return ext.Equals(".FNT", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".LSTA", StringComparison.OrdinalIgnoreCase);
+        }
 
         public (string name, byte[] data) OnExtract(byte[] srcData, string srcName, Manifest manifest)
         {
-            if (srcData.Length < 8 || !Match(srcData, 0, Magic))
+            if (srcData.Length < 8 || !srcData.AsSpan(0, 4).SequenceEqual(Magic))
                 throw new InvalidDataException("Not a FNT/LSTA file");
 
             int count = BeBinary.ReadInt32(srcData, 4);
 
-            manifest.AddFNT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            manifest.AddFNT(new Dictionary<string, string>(3, StringComparer.OrdinalIgnoreCase)
             {
                 ["kind"] = "file",
                 ["container"] = srcName,
@@ -37,7 +39,7 @@ namespace IpfbTool.Core
             int pos = 8;
             for (int i = 0; i < count; i++)
             {
-                //if (pos + EntryHeaderSize > srcData.Length) break;
+                if (pos + EntryHeaderSize > srcData.Length) break;
 
                 ushort charCode = (ushort)((srcData[pos] << 8) | srcData[pos + 1]);
                 byte isExternal = srcData[pos + 2];
@@ -46,13 +48,11 @@ namespace IpfbTool.Core
                 int dataSize = unchecked((int)TextureUtil.ReadU32BE(srcData, pos + 11));
                 pos += EntryHeaderSize;
 
-                //if (dataSize < 0 || pos + dataSize > srcData.Length) break;
-
                 string imgName = charCode.ToString("X4");
                 uint imgId = TexId.Embedded("FNT", srcName, i.ToString());
                 string pngRel = Path.Combine(folderRel, imgName + ".png");
 
-                manifest.AddFNT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                manifest.AddFNT(new Dictionary<string, string>(10, StringComparer.OrdinalIgnoreCase)
                 {
                     ["kind"] = "entry",
                     ["container"] = srcName,
@@ -67,13 +67,14 @@ namespace IpfbTool.Core
                     ["img_name"] = imgName
                 });
 
-                if (dataSize == 0) { continue; }
+                if (dataSize <= 0) continue;
+                if ((uint)dataSize > (uint)(srcData.Length - pos)) break;
 
                 byte[] payload = srcData[pos..(pos + dataSize)];
                 pos += dataSize;
 
                 if (TryExtractTexture(payload, imgId, imgName, "1", pngRel, manifest, out var png))
-                    WriteOut(pngRel, png);  
+                    WriteOut(pngRel, png);
             }
 
             return (srcName, null!);
@@ -81,28 +82,56 @@ namespace IpfbTool.Core
 
         internal static Dictionary<string, byte[]> BuildAll(Manifest manifest, string rootDir, IReadOnlyDictionary<uint, Dictionary<string, string>> texById)
         {
-            var byContainer = manifest.FNT
-                .Where(d => d.TryGetValue("kind", out var k) && k.Equals("entry", StringComparison.OrdinalIgnoreCase))
-                .GroupBy(d => Get(d, "container"), StringComparer.OrdinalIgnoreCase);
+            var byContainer = new Dictionary<string, List<Entry>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var d in manifest.FNT)
+            {
+                if (!d.TryGetValue("kind", out var k) || !k.Equals("entry", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!d.TryGetValue("container", out var c) || string.IsNullOrWhiteSpace(c))
+                    continue;
+
+                var e = ParseEntry(d);
+                if (e.Index < 0) continue;
+
+                if (!byContainer.TryGetValue(c, out var list))
+                {
+                    list = new List<Entry>();
+                    byContainer[c] = list;
+                }
+
+                list.Add(e);
+            }
 
             var res = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+            var texCache = new Dictionary<uint, byte[]>();
 
-            foreach (var g in byContainer)
+            foreach (var kv in byContainer)
             {
-                string container = g.Key;
-                var entries = g.Select(ParseEntry).Where(e => e.Index >= 0).OrderBy(e => e.Index).ToList();
+                string container = kv.Key;
+                var entries = kv.Value;
                 if (entries.Count == 0) continue;
 
-                using var ms = new MemoryStream();
+                entries.Sort(static (a, b) => a.Index.CompareTo(b.Index));
+
+                using var ms = new MemoryStream(checked(8 + entries.Count * 32));
                 ms.Write(Magic);
                 BeBinary.WriteInt32(ms, entries.Count);
 
-                foreach (var e in entries)
+                for (int i = 0; i < entries.Count; i++)
                 {
-                    byte[] imgData = Array.Empty<byte>();
+                    var e = entries[i];
 
+                    byte[] imgData = Array.Empty<byte>();
                     if (e.ImgId != 0 && texById.TryGetValue(e.ImgId, out var texEntry))
-                        imgData = BuildTexture(texEntry, rootDir);
+                    {
+                        if (!texCache.TryGetValue(e.ImgId, out imgData!))
+                        {
+                            imgData = BuildTexture(texEntry, rootDir);
+                            texCache[e.ImgId] = imgData;
+                        }
+                    }
 
                     ms.WriteByte((byte)(e.CharCode >> 8));
                     ms.WriteByte((byte)e.CharCode);
@@ -203,14 +232,6 @@ namespace IpfbTool.Core
         }
 
         static string Get(Dictionary<string, string> d, string k) =>
-            d.TryGetValue(k, out var v) ? v : "";
-
-        static bool Match(byte[] data, int pos, byte[] seq)
-        {
-            if (pos + seq.Length > data.Length) return false;
-            for (int i = 0; i < seq.Length; i++)
-                if (data[pos + i] != seq[i]) return false;
-            return true;
-        }
+            d.TryGetValue(k, out var v) ? (v ?? "") : "";
     }
 }

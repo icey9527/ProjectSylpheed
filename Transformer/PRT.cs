@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-using System.Linq;
 using System.Text;
 
 namespace IpfbTool.Core
@@ -13,18 +12,21 @@ namespace IpfbTool.Core
         static readonly uint RATB = TextureUtil.FourCC("RATB");
         static readonly uint RATA = TextureUtil.FourCC("RAT@");
 
-        static readonly byte[] OptMagic = "opt "u8.ToArray();
-        static readonly byte[] EndMagic = "end "u8.ToArray();
+        static ReadOnlySpan<byte> OptMagic => "opt "u8;
+        static ReadOnlySpan<byte> EndMagic => "end "u8;
 
         static readonly Encoding Sjis = InitEnc();
 
         public bool CanPack => false;
 
-        public bool CanTransformOnExtract(string name) =>
-            Path.GetExtension(name).Equals(".prt", StringComparison.OrdinalIgnoreCase) ||
-            Path.GetExtension(name).Equals(".RATC", StringComparison.OrdinalIgnoreCase) ||
-            Path.GetExtension(name).Equals(".RATB", StringComparison.OrdinalIgnoreCase) ||
-            Path.GetExtension(name).Equals(".RAT@", StringComparison.OrdinalIgnoreCase);
+        public bool CanTransformOnExtract(string name)
+        {
+            string ext = Path.GetExtension(name);
+            return ext.Equals(".prt", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".RATC", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".RATB", StringComparison.OrdinalIgnoreCase) ||
+                   ext.Equals(".RAT@", StringComparison.OrdinalIgnoreCase);
+        }
 
         public (string name, byte[] data) OnExtract(byte[] srcData, string srcName, Manifest manifest)
         {
@@ -57,21 +59,24 @@ namespace IpfbTool.Core
                 objSize = classTag == RATB ? 60 : 56;
             }
 
-            manifest.AddPRT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
-                ["kind"] = "header",
-                ["container"] = srcName,
-                ["class_tag"] = classTag.ToString(),
-                ["rate"] = rate.ToString(),
-                ["state"] = state16.ToString(),
-                ["frame"] = frame.ToString(),
-                ["wait_pos"] = waitPos.ToString(),
-                ["end_pos"] = endPos.ToString(),
-                ["priority"] = priority.ToString(),
-                ["num_objects"] = numObjects.ToString(),
-                ["screen_w"] = screenW.ToString(),
-                ["screen_h"] = screenH.ToString()
-            });
+                var e = new Dictionary<string, string>(13, StringComparer.OrdinalIgnoreCase)
+                {
+                    ["kind"] = "header",
+                    ["container"] = srcName,
+                    ["class_tag"] = classTag.ToString(CultureInfo.InvariantCulture),
+                    ["rate"] = rate.ToString(CultureInfo.InvariantCulture),
+                    ["state"] = state16.ToString(CultureInfo.InvariantCulture),
+                    ["frame"] = frame.ToString(CultureInfo.InvariantCulture),
+                    ["wait_pos"] = waitPos.ToString(CultureInfo.InvariantCulture),
+                    ["end_pos"] = endPos.ToString(CultureInfo.InvariantCulture),
+                    ["priority"] = priority.ToString(CultureInfo.InvariantCulture),
+                    ["num_objects"] = numObjects.ToString(CultureInfo.InvariantCulture),
+                    ["screen_w"] = screenW.ToString(CultureInfo.InvariantCulture),
+                    ["screen_h"] = screenH.ToString(CultureInfo.InvariantCulture)
+                };
+                manifest.AddPRT(e);
+            }
 
             for (int i = 0; i < numObjects; i++)
             {
@@ -84,20 +89,21 @@ namespace IpfbTool.Core
                 int centerY = r.I32();
                 int centerZ = objSize == 60 ? r.I32() : 0;
 
-                manifest.AddPRT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                var e = new Dictionary<string, string>(11, StringComparer.OrdinalIgnoreCase)
                 {
                     ["kind"] = "obj",
                     ["container"] = srcName,
-                    ["index"] = i.ToString(),
+                    ["index"] = i.ToString(CultureInfo.InvariantCulture),
                     ["szFileName"] = szFileName,
-                    ["lParent"] = lParent.ToString(),
-                    ["lMaster"] = lMaster.ToString(),
-                    ["state"] = objState.ToString(),
-                    ["buttonID"] = buttonID.ToString(),
-                    ["centerX"] = centerX.ToString(),
-                    ["centerY"] = centerY.ToString(),
-                    ["centerZ"] = centerZ.ToString()
-                });
+                    ["lParent"] = lParent.ToString(CultureInfo.InvariantCulture),
+                    ["lMaster"] = lMaster.ToString(CultureInfo.InvariantCulture),
+                    ["state"] = objState.ToString(CultureInfo.InvariantCulture),
+                    ["buttonID"] = buttonID.ToString(CultureInfo.InvariantCulture),
+                    ["centerX"] = centerX.ToString(CultureInfo.InvariantCulture),
+                    ["centerY"] = centerY.ToString(CultureInfo.InvariantCulture),
+                    ["centerZ"] = centerZ.ToString(CultureInfo.InvariantCulture)
+                };
+                manifest.AddPRT(e);
             }
 
             for (int set = 0; set < numObjects; set++)
@@ -105,14 +111,17 @@ namespace IpfbTool.Core
                 uint ownerID = r.U32();
                 uint numKeys = r.U32();
 
-                manifest.AddPRT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                 {
-                    ["kind"] = "keyset",
-                    ["container"] = srcName,
-                    ["set"] = set.ToString(),
-                    ["ownerID"] = ownerID.ToString(),
-                    ["numKeys"] = numKeys.ToString()
-                });
+                    var e = new Dictionary<string, string>(6, StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["kind"] = "keyset",
+                        ["container"] = srcName,
+                        ["set"] = set.ToString(CultureInfo.InvariantCulture),
+                        ["ownerID"] = ownerID.ToString(CultureInfo.InvariantCulture),
+                        ["numKeys"] = numKeys.ToString(CultureInfo.InvariantCulture)
+                    };
+                    manifest.AddPRT(e);
+                }
 
                 for (int k = 0; k < numKeys; k++)
                 {
@@ -127,29 +136,40 @@ namespace IpfbTool.Core
                     int ptX = r.I32();
                     int ptY = r.I32();
 
-                    manifest.AddPRT(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    var e = new Dictionary<string, string>(14, StringComparer.OrdinalIgnoreCase)
                     {
                         ["kind"] = "key",
                         ["container"] = srcName,
-                        ["set"] = set.ToString(),
-                        ["index"] = k.ToString(),
-                        ["ownerID"] = ownerID.ToString(),
-                        ["pos"] = pos.ToString(),
-                        ["diffuse"] = diffuse.ToString(),
-                        ["yaw"] = yaw.ToString(),
-                        ["pitch"] = pitch.ToString(),
-                        ["roll"] = roll.ToString(),
-                        ["stretchX"] = stretchX.ToString(),
-                        ["stretchY"] = stretchY.ToString(),
-                        ["soundID"] = soundID.ToString(),
-                        ["pt_x"] = ptX.ToString(),
-                        ["pt_y"] = ptY.ToString()
-                    });
+                        ["set"] = set.ToString(CultureInfo.InvariantCulture),
+                        ["index"] = k.ToString(CultureInfo.InvariantCulture),
+                        ["ownerID"] = ownerID.ToString(CultureInfo.InvariantCulture),
+                        ["pos"] = pos.ToString(CultureInfo.InvariantCulture),
+                        ["diffuse"] = diffuse.ToString(CultureInfo.InvariantCulture),
+                        ["yaw"] = yaw.ToString(CultureInfo.InvariantCulture),
+                        ["pitch"] = pitch.ToString(CultureInfo.InvariantCulture),
+                        ["roll"] = roll.ToString(CultureInfo.InvariantCulture),
+                        ["stretchX"] = stretchX.ToString(CultureInfo.InvariantCulture),
+                        ["stretchY"] = stretchY.ToString(CultureInfo.InvariantCulture),
+                        ["soundID"] = soundID.ToString(CultureInfo.InvariantCulture),
+                        ["pt_x"] = ptX.ToString(CultureInfo.InvariantCulture),
+                        ["pt_y"] = ptY.ToString(CultureInfo.InvariantCulture)
+                    };
+                    manifest.AddPRT(e);
                 }
             }
 
             string dirRel = Path.GetDirectoryName(srcName) ?? "";
             string folderRel = Path.Combine(dirRel, Path.GetFileNameWithoutExtension(srcName));
+
+            {
+                var e = new Dictionary<string, string>(3, StringComparer.OrdinalIgnoreCase)
+                {
+                    ["kind"] = "unpack_dir",
+                    ["container"] = srcName,
+                    ["dir"] = folderRel
+                };
+                manifest.AddPRT(e);
+            }
 
             int itemIndex = 0;
             while (!r.Eof)
@@ -176,14 +196,14 @@ namespace IpfbTool.Core
 
                     string magic4 = payload.Length >= 4 ? Encoding.ASCII.GetString(payload, 0, 4) : "";
 
-                    var entry = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    var entry = new Dictionary<string, string>(10, StringComparer.OrdinalIgnoreCase)
                     {
                         ["kind"] = "item",
                         ["container"] = srcName,
-                        ["index"] = itemIndex.ToString(),
+                        ["index"] = itemIndex.ToString(CultureInfo.InvariantCulture),
                         ["img_id"] = TexId.ToX8(imgId),
                         ["img_name"] = itemName,
-                        ["payload_size"] = payload.Length.ToString(),
+                        ["payload_size"] = payload.Length.ToString(CultureInfo.InvariantCulture),
                         ["payload_magic"] = magic4
                     };
 
@@ -196,8 +216,10 @@ namespace IpfbTool.Core
                     else
                     {
                         entry["payload_kind"] = "raw";
-                        entry["payload_b64"] = Convert.ToBase64String(payload);
+                        string rawRel = Path.Combine(folderRel, filePart);
+                        entry["payload_file"] = rawRel;
                         manifest.AddPRT(entry);
+                        WriteOut(rawRel, payload);
                     }
 
                     itemIndex++;
@@ -218,19 +240,57 @@ namespace IpfbTool.Core
 
         internal static Dictionary<string, byte[]> BuildAll(Manifest manifest, string rootDir, IReadOnlyDictionary<uint, Dictionary<string, string>> texById)
         {
-            var byContainer = manifest.PRT
-                .Where(d => d.TryGetValue("container", out var c) && !string.IsNullOrWhiteSpace(c))
-                .GroupBy(d => d["container"], StringComparer.OrdinalIgnoreCase);
+            var byContainer = new Dictionary<string, List<Dictionary<string, string>>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var d in manifest.PRT)
+            {
+                if (!d.TryGetValue("container", out var c) || string.IsNullOrWhiteSpace(c)) continue;
+                if (!byContainer.TryGetValue(c, out var list))
+                {
+                    list = new List<Dictionary<string, string>>();
+                    byContainer[c] = list;
+                }
+                list.Add(d);
+            }
 
             var res = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var g in byContainer)
+            foreach (var kv in byContainer)
             {
-                string container = g.Key;
-                var items = g.ToList();
+                string container = kv.Key;
+                var items = kv.Value;
 
-                var header = items.FirstOrDefault(d => Get(d, "kind").Equals("header", StringComparison.OrdinalIgnoreCase));
+                Dictionary<string, string>? header = null;
+
+                List<Dictionary<string, string>> objs = new();
+                List<Dictionary<string, string>> keysets = new();
+                Dictionary<int, List<Dictionary<string, string>>> keysBySet = new();
+                List<Dictionary<string, string>> subs = new();
+
+                for (int i = 0; i < items.Count; i++)
+                {
+                    var it = items[i];
+                    if (!it.TryGetValue("kind", out var kind) || string.IsNullOrEmpty(kind)) continue;
+
+                    if (kind.Equals("header", StringComparison.OrdinalIgnoreCase)) { header = it; continue; }
+                    if (kind.Equals("obj", StringComparison.OrdinalIgnoreCase)) { objs.Add(it); continue; }
+                    if (kind.Equals("keyset", StringComparison.OrdinalIgnoreCase)) { keysets.Add(it); continue; }
+                    if (kind.Equals("key", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int set = ParseI32(it, "set");
+                        if (!keysBySet.TryGetValue(set, out var list)) { list = new List<Dictionary<string, string>>(); keysBySet[set] = list; }
+                        list.Add(it);
+                        continue;
+                    }
+                    if (kind.Equals("item", StringComparison.OrdinalIgnoreCase)) { subs.Add(it); continue; }
+                }
+
                 if (header == null) continue;
+
+                objs.Sort((a, b) => ParseI32(a, "index").CompareTo(ParseI32(b, "index")));
+                keysets.Sort((a, b) => ParseI32(a, "set").CompareTo(ParseI32(b, "set")));
+                subs.Sort((a, b) => ParseI32(a, "index").CompareTo(ParseI32(b, "index")));
+                foreach (var p in keysBySet)
+                    p.Value.Sort((a, b) => ParseI32(a, "index").CompareTo(ParseI32(b, "index")));
 
                 uint classTag = ParseU32(header, "class_tag");
                 ushort rate = (ushort)ParseU32(header, "rate");
@@ -246,23 +306,7 @@ namespace IpfbTool.Core
                 bool hasScreen = classTag == RATC;
                 int objSize = classTag == RATB ? 60 : (classTag == RATA ? 56 : 60);
 
-                var objs = items.Where(d => Get(d, "kind").Equals("obj", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(d => ParseI32(d, "index"))
-                    .ToList();
-
-                var keysets = items.Where(d => Get(d, "kind").Equals("keyset", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(d => ParseI32(d, "set"))
-                    .ToList();
-
-                var keys = items.Where(d => Get(d, "kind").Equals("key", StringComparison.OrdinalIgnoreCase))
-                    .GroupBy(d => ParseI32(d, "set"))
-                    .ToDictionary(gk => gk.Key, gk => gk.OrderBy(x => ParseI32(x, "index")).ToList());
-
-                var sub = items.Where(d => Get(d, "kind").Equals("item", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(d => ParseI32(d, "index"))
-                    .ToList();
-
-                using var ms = new MemoryStream();
+                using var ms = new MemoryStream(64 * 1024);
 
                 WriteU32(ms, classTag);
                 WriteU16(ms, rate);
@@ -281,7 +325,7 @@ namespace IpfbTool.Core
 
                 for (int i = 0; i < numObjects; i++)
                 {
-                    var o = i < objs.Count ? objs[i] : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    var o = i < objs.Count ? objs[i] : null;
                     WriteFixed32(ms, Get(o, "szFileName"));
                     WriteI32(ms, ParseI32(o, "lParent"));
                     WriteI32(ms, ParseI32(o, "lMaster"));
@@ -294,18 +338,19 @@ namespace IpfbTool.Core
 
                 for (int set = 0; set < numObjects; set++)
                 {
-                    var ks = set < keysets.Count ? keysets[set] : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    var ks = set < keysets.Count ? keysets[set] : null;
                     uint ownerID = ParseU32(ks, "ownerID");
                     uint numKeys = ParseU32(ks, "numKeys");
 
                     WriteU32(ms, ownerID);
                     WriteU32(ms, numKeys);
 
-                    if (!keys.TryGetValue(set, out var list)) list = new List<Dictionary<string, string>>();
+                    keysBySet.TryGetValue(set, out var list);
+                    list ??= s_emptyList;
 
                     for (int k = 0; k < numKeys; k++)
                     {
-                        var key = k < list.Count ? list[k] : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        var key = k < list.Count ? list[k] : null;
 
                         WriteI32(ms, ParseI32(key, "pos"));
                         WriteU32(ms, ParseU32(key, "diffuse"));
@@ -320,15 +365,15 @@ namespace IpfbTool.Core
                     }
                 }
 
-                foreach (var it in sub)
+                foreach (var it in subs)
                 {
                     string imgName = Get(it, "img_name");
-                    string b64 = Get(it, "payload_b64");
+                    string fileRel = Get(it, "payload_file");
 
                     byte[] payload;
-                    if (!string.IsNullOrEmpty(b64))
+                    if (!string.IsNullOrEmpty(fileRel))
                     {
-                        payload = Convert.FromBase64String(b64);
+                        payload = File.ReadAllBytes(Path.Combine(rootDir, fileRel));
                     }
                     else
                     {
@@ -354,6 +399,8 @@ namespace IpfbTool.Core
 
             return res;
         }
+
+        static readonly List<Dictionary<string, string>> s_emptyList = new(0);
 
         static byte[] BuildTexture(Dictionary<string, string> texEntry, string rootDir)
         {
@@ -398,43 +445,43 @@ namespace IpfbTool.Core
             File.WriteAllBytes(full, data);
         }
 
-        static string Get(Dictionary<string, string> d, string k) =>
+        static string Get(Dictionary<string, string>? d, string k) =>
             d != null && d.TryGetValue(k, out var v) ? (v ?? "") : "";
 
-        static uint ParseU32(Dictionary<string, string> d, string k)
+        static uint ParseU32(Dictionary<string, string>? d, string k)
         {
-            string s = Get(d, k).Trim();
-            if (string.IsNullOrEmpty(s)) return 0;
+            if (d == null || !d.TryGetValue(k, out var s) || string.IsNullOrWhiteSpace(s)) return 0;
+            ReadOnlySpan<char> span = s.AsSpan().Trim();
 
-            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
-                uint.TryParse(s.AsSpan(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hx))
+            if (span.Length >= 2 && span[0] == '0' && (span[1] == 'x' || span[1] == 'X') &&
+                uint.TryParse(span[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hx))
                 return hx;
 
-            if (uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
+            if (uint.TryParse(span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
                 return u;
 
-            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+            if (int.TryParse(span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
                 return unchecked((uint)i);
 
-            return TexId.Parse(s);
+            return TexId.Parse(span.ToString());
         }
 
-        static int ParseI32(Dictionary<string, string> d, string k)
+        static int ParseI32(Dictionary<string, string>? d, string k)
         {
-            string s = Get(d, k).Trim();
-            if (string.IsNullOrEmpty(s)) return 0;
+            if (d == null || !d.TryGetValue(k, out var s) || string.IsNullOrWhiteSpace(s)) return 0;
+            ReadOnlySpan<char> span = s.AsSpan().Trim();
 
-            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
-                uint.TryParse(s.AsSpan(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hx))
+            if (span.Length >= 2 && span[0] == '0' && (span[1] == 'x' || span[1] == 'X') &&
+                uint.TryParse(span[2..], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var hx))
                 return unchecked((int)hx);
 
-            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
+            if (int.TryParse(span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i))
                 return i;
 
-            if (uint.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
+            if (uint.TryParse(span, NumberStyles.Integer, CultureInfo.InvariantCulture, out var u))
                 return unchecked((int)u);
 
-            return unchecked((int)TexId.Parse(s));
+            return unchecked((int)TexId.Parse(span.ToString()));
         }
 
         static void WriteU32(Stream s, uint v)
@@ -458,8 +505,8 @@ namespace IpfbTool.Core
             Span<byte> buf = stackalloc byte[32];
             buf.Clear();
 
-            var b = Sjis.GetBytes(text ?? "");
-            int n = Math.Min(32, b.Length);
+            byte[] b = Sjis.GetBytes(text ?? "");
+            int n = b.Length > 32 ? 32 : b.Length;
             b.AsSpan(0, n).CopyTo(buf);
 
             s.Write(buf);
@@ -510,6 +557,14 @@ namespace IpfbTool.Core
                 return v;
             }
 
+            public ReadOnlySpan<byte> Span(int n)
+            {
+                if (n < 0 || p + n > d.Length) throw new EndOfStreamException();
+                var s = d.AsSpan(p, n);
+                p += n;
+                return s;
+            }
+
             public byte[] Bytes(int n)
             {
                 if (n < 0 || p + n > d.Length) throw new EndOfStreamException();
@@ -520,18 +575,18 @@ namespace IpfbTool.Core
 
             public string StrFixed(int n)
             {
-                var b = Bytes(n);
-                int z = Array.IndexOf(b, (byte)0);
-                if (z >= 0) b = b[..z];
-                return Sjis.GetString(b).Trim();
+                var s = Span(n);
+                int z = s.IndexOf((byte)0);
+                if (z >= 0) s = s[..z];
+                return Sjis.GetString(s).Trim();
             }
 
             public string StrVar(int n)
             {
-                var b = Bytes(n);
-                int z = Array.IndexOf(b, (byte)0);
-                if (z >= 0) b = b[..z];
-                return Sjis.GetString(b).Trim();
+                var s = Span(n);
+                int z = s.IndexOf((byte)0);
+                if (z >= 0) s = s[..z];
+                return Sjis.GetString(s).Trim();
             }
 
             public uint? PeekU32()
@@ -540,7 +595,7 @@ namespace IpfbTool.Core
                 return TextureUtil.ReadU32BE(d, p);
             }
 
-            public bool Peek4(byte[] seq)
+            public bool Peek4(ReadOnlySpan<byte> seq)
             {
                 if (p + 4 > d.Length) return false;
                 return d[p] == seq[0] && d[p + 1] == seq[1] && d[p + 2] == seq[2] && d[p + 3] == seq[3];

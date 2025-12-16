@@ -3,11 +3,13 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using IpfbTool.Core;
+using ICSharpCode.SharpZipLib.Zip.Compression;
+using ICSharpCode.SharpZipLib.Zip.Compression.Streams;
 
 namespace IpfbTool.Archive
 {
@@ -15,19 +17,21 @@ namespace IpfbTool.Archive
     {
         public static void Pack(string inputDir, string pakPath)
         {
+            using var log = new AsyncLog();
+
             var manifest = Manifest.Load(Path.Combine(inputDir, "list.xml"));
 
             var texById = BuildTexIndexById(manifest);
             var managedPngFull = BuildManagedPngSet(inputDir, manifest);
             var builtRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // 先做必须串行的“构建类产物”
             var fixedOutputs = new List<(uint hash, byte[] data)>(capacity: 1024);
 
-            BuildStandaloneTextures(manifest, inputDir, fixedOutputs, builtRel);
+            BuildStandaloneTextures(manifest, inputDir, fixedOutputs, builtRel, log);
 
             foreach (var kv in FNT.BuildAll(manifest, inputDir, texById))
             {
+                log.Write(kv.Key);
                 uint hash = FileId.FromPath(kv.Key);
                 byte[] data = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
                 fixedOutputs.Add((hash, data));
@@ -36,16 +40,28 @@ namespace IpfbTool.Archive
 
             foreach (var kv in PRT.BuildAll(manifest, inputDir, texById))
             {
+                log.Write(kv.Key);
                 uint hash = FileId.FromPath(kv.Key);
                 byte[] data = ShouldCompress(kv.Key) ? CompressCustomBytes(kv.Value) : kv.Value;
                 fixedOutputs.Add((hash, data));
                 builtRel.Add(NormRel(kv.Key));
             }
 
-            // 收集需要走插件/原始打包的文件
-            var files = CollectFiles(inputDir, managedPngFull, builtRel);
+            var skipDirs = new List<string>();
+            foreach (var d in manifest.PRT)
+            {
+                if (d.TryGetValue("kind", out var k) &&
+                    k.Equals("unpack_dir", StringComparison.OrdinalIgnoreCase) &&
+                    d.TryGetValue("dir", out var dir) &&
+                    !string.IsNullOrWhiteSpace(dir))
+                {
+                    skipDirs.Add(NormRel(dir).TrimEnd('/') + "/");
+                }
+            }
+            skipDirs.Sort(StringComparer.OrdinalIgnoreCase);
 
-            // 并行处理文件：用线程本地 list 收集，最后合并，避免 ConcurrentDictionary 热点
+            var files = CollectFiles(inputDir, managedPngFull, builtRel, skipDirs);
+
             var bag = new ConcurrentBag<List<(uint hash, byte[] data)>>();
 
             int dop = Math.Clamp(Environment.ProcessorCount, 1, 12);
@@ -58,6 +74,7 @@ namespace IpfbTool.Archive
                     string fullPath = Path.Combine(inputDir, rel);
 
                     var (packedName, packedData) = Transformers.ProcessPack(rel, fullPath);
+                    Console.WriteLine(packedName);
 
                     uint hash = FileId.FromPath(packedName);
                     byte[] chunk = ShouldCompress(packedName) ? CompressCustomBytes(packedData) : packedData;
@@ -68,13 +85,10 @@ namespace IpfbTool.Archive
                 local => bag.Add(local)
             );
 
-            // 合并所有输出
             var all = new List<(uint hash, byte[] data)>(fixedOutputs.Count + files.Count);
             all.AddRange(fixedOutputs);
             foreach (var local in bag) all.AddRange(local);
 
-            // 去重：同 hash 后写覆盖前写（行为与 ConcurrentDictionary 最接近）
-            // 若你希望“重复视为错误”，这里也可以改成 throw
             var map = new Dictionary<uint, byte[]>(all.Count);
             foreach (var (hash, data) in all) map[hash] = data;
 
@@ -107,7 +121,8 @@ namespace IpfbTool.Archive
             Manifest manifest,
             string rootDir,
             List<(uint hash, byte[] data)> outputs,
-            HashSet<string> builtRel)
+            HashSet<string> builtRel,
+            AsyncLog log)
         {
             foreach (var t in manifest.T32)
             {
@@ -115,6 +130,8 @@ namespace IpfbTool.Archive
 
                 string name = G(t, "name");
                 if (string.IsNullOrWhiteSpace(name)) continue;
+
+                log.Write(name);
 
                 byte[] data = BuildTextureBytes(t, rootDir);
                 uint hash = FileId.FromPath(name);
@@ -132,9 +149,13 @@ namespace IpfbTool.Archive
                 : T32.Build(texEntry, rootDir);
         }
 
-        static List<string> CollectFiles(string root, HashSet<string> managedPngFull, HashSet<string> builtRel)
+        static List<string> CollectFiles(
+            string root,
+            HashSet<string> managedPngFull,
+            HashSet<string> builtRel,
+            List<string> skipDirs)
         {
-            var list = new List<string>();
+            var list = new List<string>(8192);
 
             foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
             {
@@ -146,6 +167,8 @@ namespace IpfbTool.Archive
                 string relNorm = NormRel(rel);
                 if (builtRel.Contains(relNorm)) continue;
 
+                if (skipDirs.Count != 0 && IsInSkipDir(relNorm, skipDirs)) continue;
+
                 if (name.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
                 {
                     string full = Path.GetFullPath(file);
@@ -156,6 +179,16 @@ namespace IpfbTool.Archive
             }
 
             return list;
+        }
+
+        static bool IsInSkipDir(string relNorm, List<string> skipDirs)
+        {
+            for (int i = 0; i < skipDirs.Count; i++)
+            {
+                if (relNorm.StartsWith(skipDirs[i], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         static bool ShouldCompress(string relPath)
@@ -176,7 +209,8 @@ namespace IpfbTool.Archive
 
             var entries = new List<Entry>(sorted.Count);
 
-            // 写 p00：顺序写 + 一次性写 padding
+            byte[] padBuf = new byte[2048];
+
             using (var p00 = new FileStream(p00Path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan))
             {
                 for (int i = 0; i < sorted.Count; i++)
@@ -192,17 +226,11 @@ namespace IpfbTool.Archive
                     if (i < sorted.Count - 1)
                     {
                         int pad = (int)((2048 - (p00.Position & 2047)) & 2047);
-                        if (pad != 0)
-                        {
-                            Span<byte> zeros = pad <= 4096 ? stackalloc byte[pad] : new byte[pad];
-                            zeros.Clear();
-                            p00.Write(zeros);
-                        }
+                        if (pad != 0) p00.Write(padBuf, 0, pad);
                     }
                 }
             }
 
-            // 写 pak 头与索引
             using var pakFs = new FileStream(pakPath, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
             using var bw = new BinaryWriter(pakFs, Encoding.ASCII, leaveOpen: true);
 
@@ -219,19 +247,24 @@ namespace IpfbTool.Archive
             }
         }
 
+        static readonly ThreadLocal<Deflater> s_deflater = new(() => new Deflater(7, noZlibHeaderOrFooter: true));
+
         static byte[] CompressCustomBytes(byte[] raw)
         {
-            // Deflate 输出先到 MemoryStream，但避免 ToArray 的额外拷贝：TryGetBuffer + 精确复制
-            using var compMs = new MemoryStream(raw.Length / 2);
-            using (var ds = new DeflateStream(compMs, CompressionLevel.SmallestSize, leaveOpen: true))
+            var deflater = s_deflater.Value!;
+            deflater.Reset();
+            deflater.SetLevel(7);
+
+            using var ms = new MemoryStream(raw.Length / 2);
+            using (var ds = new DeflaterOutputStream(ms, deflater))
             {
+                ds.IsStreamOwner = false;
                 ds.Write(raw, 0, raw.Length);
+                ds.Finish();
             }
 
-            if (!compMs.TryGetBuffer(out ArraySegment<byte> seg))
-                seg = new ArraySegment<byte>(compMs.ToArray());
-
-            int compLen = (int)compMs.Length;
+            byte[] def = ms.ToArray();
+            int compLen = def.Length;
 
             uint len = (uint)raw.Length;
             uint adler = Adler32(raw);
@@ -242,27 +275,47 @@ namespace IpfbTool.Archive
             result[0] = (byte)'Z'; result[1] = (byte)'1';
             result[2] = (byte)(len >> 24); result[3] = (byte)(len >> 16);
             result[4] = (byte)(len >> 8); result[5] = (byte)len;
+
             result[6] = (byte)(adler >> 24); result[7] = (byte)(adler >> 16);
             result[8] = (byte)(adler >> 8); result[9] = (byte)adler;
+
             result[10] = 0x78; result[11] = 0xDA;
 
-            Buffer.BlockCopy(seg.Array!, seg.Offset, result, 12, compLen);
+            Buffer.BlockCopy(def, 0, result, 12, compLen);
 
             int p = 12 + compLen;
-            result[p] = (byte)(adler >> 24); result[p + 1] = (byte)(adler >> 16);
-            result[p + 2] = (byte)(adler >> 8); result[p + 3] = (byte)adler;
+            result[p] = (byte)(adler >> 24);
+            result[p + 1] = (byte)(adler >> 16);
+            result[p + 2] = (byte)(adler >> 8);
+            result[p + 3] = (byte)adler;
 
             return result;
         }
 
-        static uint Adler32(byte[] data)
+        static uint Adler32(ReadOnlySpan<byte> data)
         {
+            const uint MOD = 65521;
             uint a = 1, b = 0;
-            for (int i = 0; i < data.Length; i++)
+
+            int i = 0;
+            int len = data.Length;
+            const int NMAX = 5552;
+
+            while (len > 0)
             {
-                a = (a + data[i]) % 65521;
-                b = (b + a) % 65521;
+                int n = len < NMAX ? len : NMAX;
+                len -= n;
+
+                for (int j = 0; j < n; j++)
+                {
+                    a += data[i++];
+                    b += a;
+                }
+
+                a %= MOD;
+                b %= MOD;
             }
+
             return (b << 16) | a;
         }
 
@@ -275,6 +328,37 @@ namespace IpfbTool.Archive
         {
             public uint Hash;
             public int Offset, Size;
+        }
+
+        sealed class AsyncLog : IDisposable
+        {
+            readonly BlockingCollection<string> q = new(new ConcurrentQueue<string>(), boundedCapacity: 4096);
+            readonly Thread t;
+
+            public AsyncLog()
+            {
+                t = new Thread(Consume) { IsBackground = true, Name = "pack-log" };
+                t.Start();
+            }
+
+            public void Write(string s)
+            {
+                if (string.IsNullOrEmpty(s)) return;
+                q.TryAdd(s);
+            }
+
+            void Consume()
+            {
+                foreach (var s in q.GetConsumingEnumerable())
+                    Console.WriteLine(s);
+            }
+
+            public void Dispose()
+            {
+                q.CompleteAdding();
+                try { t.Join(); } catch { }
+                q.Dispose();
+            }
         }
     }
 }

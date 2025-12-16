@@ -12,7 +12,6 @@ namespace IpfbTool.Archive
     internal static class IpfbUnpack
     {
         static Manifest _manifest = null!;
-
         public static Manifest CurrentManifest => _manifest;
 
         public static void Unpack(string pakPath, string outDir)
@@ -51,10 +50,8 @@ namespace IpfbTool.Archive
             string baseName = Path.GetFileNameWithoutExtension(pakPath);
             PackContext.CurrentOutputDir = outDir;
 
-            // 1) 按 part 分组：每个 part 文件只打开一次
             var byPart = GroupByPart(entries);
 
-            // 2) part 级别并行：通常比 entry 级别并行更快、更稳
             int maxPartDop = Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
             var po = new ParallelOptions { MaxDegreeOfParallelism = Math.Min(maxPartDop, byPart.Count) };
 
@@ -63,7 +60,6 @@ namespace IpfbTool.Archive
                 int partIndex = kvp.Key;
                 var list = kvp.Value;
 
-                // 同 part 内按 offset 排序，尽量顺序读
                 list.Sort(static (a, b) => a.InnerOffset.CompareTo(b.InnerOffset));
 
                 string partPath = Path.Combine(pakDir, $"{baseName}.p{partIndex:00}");
@@ -109,52 +105,57 @@ namespace IpfbTool.Archive
 
             partFs.Position = innerOffset;
 
-            // 读取 raw：不清零，少一点开销
-            byte[] raw = GC.AllocateUninitializedArray<byte>(size);
-            ReadExactly(partFs, raw);
-
-            byte[] payload = DecodePayload(raw);
-
-            string name;
-            if (!NameTable.TryGet(e.Hash, out name) || string.IsNullOrWhiteSpace(name))
+            byte[] raw = ArrayPool<byte>.Shared.Rent(size);
+            try
             {
-                name = "$" + e.Hash.ToString("X8");
-                name = TryAppendPrefixExtension(name, payload);
+                ReadExactly(partFs, raw, size);
+
+                byte[] payload = DecodePayload(raw, size);
+
+                string name;
+                if (!NameTable.TryGet(e.Hash, out name) || string.IsNullOrWhiteSpace(name))
+                {
+                    name = "$" + e.Hash.ToString("X8");
+                    name = TryAppendPrefixExtension(name, payload);
+                }
+                Console.WriteLine(name);
+
+                string outPath = Path.Combine(outRoot, name);
+                string? dir = Path.GetDirectoryName(outPath);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+
+                Transformers.ProcessExtract(name, outPath, payload, _manifest);
             }
-
-            string outPath = Path.Combine(outRoot, name);
-            string? dir = Path.GetDirectoryName(outPath);
-            if (!string.IsNullOrEmpty(dir))
-                Directory.CreateDirectory(dir);
-
-            // 必须 byte[] 给插件：这里保持你原有的行为
-            Transformers.ProcessExtract(name, outPath, payload, _manifest);
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(raw);
+            }
         }
 
-        static byte[] DecodePayload(byte[] raw)
+        static byte[] DecodePayload(byte[] raw, int rawLen)
         {
-            // 格式判断保持原样：Z1 + 头尾处理
-            if (raw.Length > 16 && raw[0] == (byte)'Z' && raw[1] == (byte)'1')
+            if (rawLen > 16 && raw[0] == (byte)'Z' && raw[1] == (byte)'1')
             {
-                // raw[12..^4] 是 deflate 数据（按你原逻辑）
-                using var ms = new MemoryStream(raw, 12, raw.Length - 16, writable: false);
+                using var ms = new MemoryStream(raw, 12, rawLen - 16, writable: false);
                 using var ds = new DeflateStream(ms, CompressionMode.Decompress);
 
-                // 用可增长缓冲减少 MemoryStream 的多次扩容/拷贝
-                using var vb = new ValueBuffer(initialCapacity: Math.Max(4096, raw.Length * 2));
+                using var vb = new ValueBuffer(initialCapacity: Math.Max(4096, rawLen * 2));
                 ds.CopyTo(vb);
                 return vb.ToArray();
             }
 
-            return raw;
+            var payload = new byte[rawLen];
+            Buffer.BlockCopy(raw, 0, payload, 0, rawLen);
+            return payload;
         }
 
-        static void ReadExactly(Stream s, byte[] buffer)
+        static void ReadExactly(Stream s, byte[] buffer, int count)
         {
             int read = 0;
-            while (read < buffer.Length)
+            while (read < count)
             {
-                int r = s.Read(buffer, read, buffer.Length - read);
+                int r = s.Read(buffer, read, count - read);
                 if (r <= 0) throw new EndOfStreamException();
                 read += r;
             }
@@ -164,7 +165,6 @@ namespace IpfbTool.Archive
         {
             if (payload.Length < 3) return name;
 
-            // 只看前 4 字节是否是 ASCII 字母数字，避免 Encoding 开销
             int n = Math.Min(4, payload.Length);
             Span<char> tmp = stackalloc char[4];
 
@@ -193,15 +193,9 @@ namespace IpfbTool.Archive
             public uint Hash;
             public int Offset;
             public int Size;
-
-            // 预计算，减少重复位运算
             public long InnerOffset;
         }
 
-        /// <summary>
-        /// 简洁的“可增长 byte 缓冲”，内部用 ArrayPool，最后 ToArray 一次性拷贝输出。
-        /// 由于插件必须 byte[]，最终拷贝不可避免，但能减少中间扩容带来的多次拷贝。
-        /// </summary>
         sealed class ValueBuffer : Stream
         {
             byte[] _buf;

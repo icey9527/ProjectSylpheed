@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using SixLabors.ImageSharp;
@@ -55,10 +54,79 @@ namespace IpfbTool.Core
             ValidateSize(magic, width, height, parts, data.Length);
 
             var img = new Image<Rgba32>(width, height);
+            bool is1555 = magic is "1555" or "T1aD";
 
             if (parts <= 0)
             {
-                DecodeBlockBe(data, magic, bpp, 0, 0, width, height, 0x2C, img);
+                int w = width, h = height;
+                int pitch = bpp == 4 ? checked(w * 4) : checked(((w * 2) + 3) & ~3);
+                int start = 0x2C;
+
+                long need = (long)start + (long)pitch * h;
+                if ((uint)start > (uint)data.Length || need > data.Length)
+                    throw new InvalidDataException($"Pixel data out of range start={start} pitch={pitch} h={h} len={data.Length}");
+
+                img.ProcessPixelRows(accessor =>
+                {
+                    int imgW = accessor.Width;
+                    int imgH = accessor.Height;
+
+                    int dx = 0, dy = 0;
+                    int cw = w, ch = h;
+                    if (dx < 0 || dy < 0) return;
+                    if (dx >= imgW || dy >= imgH) return;
+                    if (dx + cw > imgW) cw = imgW - dx;
+                    if (dy + ch > imgH) ch = imgH - dy;
+                    if (cw <= 0 || ch <= 0) return;
+
+                    if (bpp == 4)
+                    {
+                        for (int y = 0; y < ch; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, cw * 4);
+                            for (int x = 0, p = 0; x < cw; x++, p += 4)
+                                dstRow[x] = new Rgba32(src[p + 1], src[p + 2], src[p + 3], src[p + 0]);
+                        }
+                    }
+                    else if (is1555)
+                    {
+                        for (int y = 0; y < ch; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, cw * 2);
+                            for (int x = 0, p = 0; x < cw; x++, p += 2)
+                            {
+                                ushort v = (ushort)((src[p] << 8) | src[p + 1]);
+                                dstRow[x] = new Rgba32(
+                                    (byte)(((v >> 10) & 0x1F) << 3),
+                                    (byte)(((v >> 5) & 0x1F) << 3),
+                                    (byte)((v & 0x1F) << 3),
+                                    (byte)(((v >> 15) & 1) * 255)
+                                );
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int y = 0; y < ch; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, cw * 2);
+                            for (int x = 0, p = 0; x < cw; x++, p += 2)
+                            {
+                                ushort v = (ushort)((src[p] << 8) | src[p + 1]);
+                                dstRow[x] = new Rgba32(
+                                    (byte)(((v >> 8) & 0xF) * 17),
+                                    (byte)(((v >> 4) & 0xF) * 17),
+                                    (byte)((v & 0xF) * 17),
+                                    (byte)(((v >> 12) & 0xF) * 17)
+                                );
+                            }
+                        }
+                    }
+                });
+
                 return img;
             }
 
@@ -66,19 +134,120 @@ namespace IpfbTool.Core
             if (0x2C + tableBytes > data.Length)
                 throw new InvalidDataException($"Bad table magic={magic} parts={parts} len={data.Length}");
 
+            int[] startArr = new int[parts];
+            int[] xArr = new int[parts];
+            int[] yArr = new int[parts];
+            int[] wArr = new int[parts];
+            int[] hArr = new int[parts];
+            int[] pitchArr = new int[parts];
+
             for (int i = 0; i < parts; i++)
             {
                 int blockOfs = BeBinary.ReadInt32(data, 0x2C + i * 4);
-                //if (blockOfs < 0 || blockOfs + 0x10 > data.Length) continue;
+                if ((uint)blockOfs > (uint)(data.Length - 0x10))
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
 
-                int x = BeBinary.ReadInt32(data, blockOfs);
+                int x = BeBinary.ReadInt32(data, blockOfs + 0);
                 int y = BeBinary.ReadInt32(data, blockOfs + 4);
                 int w = BeBinary.ReadInt32(data, blockOfs + 8);
                 int h = BeBinary.ReadInt32(data, blockOfs + 12);
-                if (w <= 0 || h <= 0) continue;
 
-                DecodeBlockBe(data, magic, bpp, x, y, w, h, blockOfs + 0x10, img);
+                if (w <= 0 || h <= 0)
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
+
+                int pitch = bpp == 4 ? checked(w * 4) : checked(((w * 2) + 3) & ~3);
+                int start = checked(blockOfs + 0x10);
+
+                long need = (long)start + (long)pitch * h;
+                if ((uint)start > (uint)data.Length || need > data.Length)
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
+
+                startArr[i] = start;
+                xArr[i] = x;
+                yArr[i] = y;
+                wArr[i] = w;
+                hArr[i] = h;
+                pitchArr[i] = pitch;
             }
+
+            img.ProcessPixelRows(accessor =>
+            {
+                int imgW = accessor.Width;
+                int imgH = accessor.Height;
+
+                for (int i = 0; i < parts; i++)
+                {
+                    int start = startArr[i];
+                    if (start < 0) continue;
+
+                    int dx = xArr[i], dy = yArr[i], w = wArr[i], h = hArr[i], pitch = pitchArr[i];
+
+                    if (w <= 0 || h <= 0) continue;
+                    if (dx < 0 || dy < 0) continue;
+                    if (dx >= imgW || dy >= imgH) continue;
+
+                    int cw = w, ch = h;
+                    if (dx + cw > imgW) cw = imgW - dx;
+                    if (dy + ch > imgH) ch = imgH - dy;
+                    if (cw <= 0 || ch <= 0) continue;
+
+                    if (bpp == 4)
+                    {
+                        for (int y = 0; y < ch; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, cw * 4);
+                            for (int x = 0, p = 0; x < cw; x++, p += 4)
+                                dstRow[x] = new Rgba32(src[p + 1], src[p + 2], src[p + 3], src[p + 0]);
+                        }
+                    }
+                    else if (is1555)
+                    {
+                        for (int y = 0; y < ch; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, cw * 2);
+                            for (int x = 0, p = 0; x < cw; x++, p += 2)
+                            {
+                                ushort v = (ushort)((src[p] << 8) | src[p + 1]);
+                                dstRow[x] = new Rgba32(
+                                    (byte)(((v >> 10) & 0x1F) << 3),
+                                    (byte)(((v >> 5) & 0x1F) << 3),
+                                    (byte)((v & 0x1F) << 3),
+                                    (byte)(((v >> 15) & 1) * 255)
+                                );
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int y = 0; y < ch; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(dy + y).Slice(dx, cw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, cw * 2);
+                            for (int x = 0, p = 0; x < cw; x++, p += 2)
+                            {
+                                ushort v = (ushort)((src[p] << 8) | src[p + 1]);
+                                dstRow[x] = new Rgba32(
+                                    (byte)(((v >> 8) & 0xF) * 17),
+                                    (byte)(((v >> 4) & 0xF) * 17),
+                                    (byte)((v & 0xF) * 17),
+                                    (byte)(((v >> 12) & 0xF) * 17)
+                                );
+                            }
+                        }
+                    }
+                }
+            });
 
             return img;
         }
@@ -133,35 +302,137 @@ namespace IpfbTool.Core
 
             var img = new Image<Rgba32>(width, height);
 
+            int[] startArr = new int[parts];
+            int[] pitchArr = new int[parts];
+            int[] xArr = new int[parts];
+            int[] yArr = new int[parts];
+            int[] wArr = new int[parts];
+            int[] hArr = new int[parts];
+
             for (int i = 0; i < parts; i++)
             {
                 int ofs = BeBinary.ReadInt32(data, baseOffset + i * 4, true);
-                if (ofs < 0 || ofs + 16 > data.Length)
-                    throw new InvalidDataException($"Legacy block ofs out of range i={i} ofs={ofs} len={data.Length}");
+                if ((uint)ofs > (uint)(data.Length - 16))
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
 
                 int px = BeBinary.ReadInt32(data, ofs + 0, true);
                 int py = BeBinary.ReadInt32(data, ofs + 4, true);
                 int pw = BeBinary.ReadInt32(data, ofs + 8, true);
                 int ph = BeBinary.ReadInt32(data, ofs + 12, true);
 
-                if (pw <= 0 || ph <= 0) continue;
-                if (px < 0 || py < 0) throw new InvalidDataException("Legacy block pos < 0");
-                if (px >= width || py >= height) continue;
+                if (pw <= 0 || ph <= 0)
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
+
+                if (px < 0 || py < 0)
+                    throw new InvalidDataException("Legacy block pos < 0");
+
+                if (px >= width || py >= height)
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
 
                 int cw = pw;
                 int ch = ph;
                 if (px + cw > width) cw = width - px;
                 if (py + ch > height) ch = height - py;
-                if (cw <= 0 || ch <= 0) continue;
+                if (cw <= 0 || ch <= 0)
+                {
+                    startArr[i] = -1;
+                    continue;
+                }
 
                 int pitch = Align4(checked(pw * bpp));
-                long start = (long)ofs + 16;
-                long total = (long)pitch * ph;
-                if (start < 0 || start + total > data.Length)
-                    throw new InvalidDataException($"Legacy pixel out of range i={i} start={start} total={total} len={data.Length}");
+                int start = checked(ofs + 16);
 
-                DecodeBlockLegacyLe(data, img, px, py, cw, ch, pitch, (int)start, bpp, is1555);
+                long need = (long)start + (long)pitch * ph;
+                if ((uint)start > (uint)data.Length || need > data.Length)
+                    throw new InvalidDataException($"Legacy pixel out of range i={i} start={start} total={(long)pitch * ph} len={data.Length}");
+
+                startArr[i] = start;
+                pitchArr[i] = pitch;
+                xArr[i] = px;
+                yArr[i] = py;
+                wArr[i] = cw;
+                hArr[i] = ch;
             }
+
+            img.ProcessPixelRows(accessor =>
+            {
+                int imgW = accessor.Width;
+                int imgH = accessor.Height;
+
+                for (int i = 0; i < parts; i++)
+                {
+                    int start = startArr[i];
+                    if (start < 0) continue;
+
+                    int px = xArr[i], py = yArr[i], cw = wArr[i], ch = hArr[i];
+                    int pitch = pitchArr[i];
+
+                    if (cw <= 0 || ch <= 0) continue;
+                    if (px < 0 || py < 0) continue;
+                    if (px >= imgW || py >= imgH) continue;
+
+                    int rw = cw, rh = ch;
+                    if (px + rw > imgW) rw = imgW - px;
+                    if (py + rh > imgH) rh = imgH - py;
+                    if (rw <= 0 || rh <= 0) continue;
+
+                    if (bpp == 4)
+                    {
+                        for (int y = 0; y < rh; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(py + y).Slice(px, rw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, rw * 4);
+                            for (int x = 0, p = 0; x < rw; x++, p += 4)
+                                dstRow[x] = new Rgba32(src[p + 2], src[p + 1], src[p + 0], src[p + 3]);
+                        }
+                    }
+                    else if (is1555)
+                    {
+                        for (int y = 0; y < rh; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(py + y).Slice(px, rw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, rw * 2);
+                            for (int x = 0, p = 0; x < rw; x++, p += 2)
+                            {
+                                ushort v = (ushort)(src[p] | (src[p + 1] << 8));
+                                dstRow[x] = new Rgba32(
+                                    (byte)(((v >> 10) & 0x1F) << 3),
+                                    (byte)(((v >> 5) & 0x1F) << 3),
+                                    (byte)((v & 0x1F) << 3),
+                                    (byte)(((v >> 15) & 1) * 255)
+                                );
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int y = 0; y < rh; y++)
+                        {
+                            Span<Rgba32> dstRow = accessor.GetRowSpan(py + y).Slice(px, rw);
+                            ReadOnlySpan<byte> src = data.AsSpan(start + y * pitch, rw * 2);
+                            for (int x = 0, p = 0; x < rw; x++, p += 2)
+                            {
+                                ushort v = (ushort)(src[p] | (src[p + 1] << 8));
+                                dstRow[x] = new Rgba32(
+                                    (byte)(((v >> 8) & 0xF) * 17),
+                                    (byte)(((v >> 4) & 0xF) * 17),
+                                    (byte)((v & 0xF) * 17),
+                                    (byte)(((v >> 12) & 0xF) * 17)
+                                );
+                            }
+                        }
+                    }
+                }
+            });
 
             return img;
         }
@@ -177,38 +448,106 @@ namespace IpfbTool.Core
             const int tile = 256;
             int cols = (width + tile - 1) / tile, rows = (height + tile - 1) / tile;
 
-            var blocks = new List<(int X, int Y, int W, int H, int Pitch, int Offset)>();
-            int offset = 0x2C + cols * rows * 4;
+            int parts = checked(cols * rows);
+            int tableBase = 0x2C;
+            int dataBase = checked(tableBase + parts * 4);
 
-            for (int iy = 0; iy < rows; iy++)
-            for (int ix = 0; ix < cols; ix++)
+            int ofs = dataBase;
+            int[] blockOfs = new int[parts];
+            int[] blockPitch = new int[parts];
+            int[] blockW = new int[parts];
+            int[] blockH = new int[parts];
+
+            for (int iy = 0, i = 0; iy < rows; iy++)
+            for (int ix = 0; ix < cols; ix++, i++)
             {
-                int x = ix * tile, y = iy * tile;
-                int w = Math.Min(tile, width - x), h = Math.Min(tile, height - y);
-                if (w <= 0 || h <= 0) continue;
-                int pitch = bpp == 4 ? w * 4 : ((w * 2 + 3) & ~3);
-                blocks.Add((x, y, w, h, pitch, offset));
-                offset += 0x10 + pitch * h;
+                int bx = ix * tile, by = iy * tile;
+                int w = Math.Min(tile, width - bx), h = Math.Min(tile, height - by);
+                if (w <= 0 || h <= 0) { blockOfs[i] = ofs; blockPitch[i] = 0; blockW[i] = 0; blockH[i] = 0; continue; }
+                int pitch = bpp == 4 ? checked(w * 4) : checked(((w * 2) + 3) & ~3);
+                blockOfs[i] = ofs;
+                blockPitch[i] = pitch;
+                blockW[i] = w;
+                blockH[i] = h;
+                ofs = checked(ofs + 0x10 + pitch * h);
             }
 
-            byte[] result = new byte[offset];
-            Array.Copy(header, 0, result, 0, 0x2C);
+            byte[] result = new byte[ofs];
+            Buffer.BlockCopy(header, 0, result, 0, 0x2C);
 
             BeBinary.WriteInt32(result, 0x14, width);
             BeBinary.WriteInt32(result, 0x18, height);
-            BeBinary.WriteInt32(result, 0x1C, blocks.Count);
+            BeBinary.WriteInt32(result, 0x1C, parts);
 
-            for (int i = 0; i < blocks.Count; i++)
-                BeBinary.WriteInt32(result, 0x2C + i * 4, blocks[i].Offset);
+            for (int i = 0; i < parts; i++)
+                BeBinary.WriteInt32(result, tableBase + i * 4, blockOfs[i]);
 
-            foreach (var b in blocks)
+            img.ProcessPixelRows(accessor =>
             {
-                BeBinary.WriteInt32(result, b.Offset + 0x00, b.X);
-                BeBinary.WriteInt32(result, b.Offset + 0x04, b.Y);
-                BeBinary.WriteInt32(result, b.Offset + 0x08, b.W);
-                BeBinary.WriteInt32(result, b.Offset + 0x0C, b.H);
-                EncodeBlockBe(img, result, b.X, b.Y, b.W, b.H, b.Offset + 0x10, b.Pitch, bpp, is1555);
-            }
+                for (int iy = 0, i = 0; iy < rows; iy++)
+                for (int ix = 0; ix < cols; ix++, i++)
+                {
+                    int w = blockW[i], h = blockH[i];
+                    if (w <= 0 || h <= 0) continue;
+
+                    int bx = ix * tile, by = iy * tile;
+                    int bo = blockOfs[i];
+                    int pitch = blockPitch[i];
+                    int start = bo + 0x10;
+
+                    BeBinary.WriteInt32(result, bo + 0x00, bx);
+                    BeBinary.WriteInt32(result, bo + 0x04, by);
+                    BeBinary.WriteInt32(result, bo + 0x08, w);
+                    BeBinary.WriteInt32(result, bo + 0x0C, h);
+
+                    if (bpp == 4)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(start + y * pitch, w * 4);
+                            for (int x = 0, p = 0; x < w; x++, p += 4)
+                            {
+                                var px = srcRow[x];
+                                outRow[p + 0] = px.A;
+                                outRow[p + 1] = px.R;
+                                outRow[p + 2] = px.G;
+                                outRow[p + 3] = px.B;
+                            }
+                        }
+                    }
+                    else if (is1555)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(start + y * pitch, w * 2);
+                            for (int x = 0, p = 0; x < w; x++, p += 2)
+                            {
+                                var px = srcRow[x];
+                                ushort v = (ushort)(((px.A > 127 ? 1 : 0) << 15) | ((px.R >> 3) << 10) | ((px.G >> 3) << 5) | (px.B >> 3));
+                                outRow[p + 0] = (byte)(v >> 8);
+                                outRow[p + 1] = (byte)v;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(start + y * pitch, w * 2);
+                            for (int x = 0, p = 0; x < w; x++, p += 2)
+                            {
+                                var px = srcRow[x];
+                                ushort v = (ushort)(((px.A >> 4) << 12) | ((px.R >> 4) << 8) | ((px.G >> 4) << 4) | (px.B >> 4));
+                                outRow[p + 0] = (byte)(v >> 8);
+                                outRow[p + 1] = (byte)v;
+                            }
+                        }
+                    }
+                }
+            });
 
             return result;
         }
@@ -232,167 +571,108 @@ namespace IpfbTool.Core
             const int tile = 256;
             int cols = (width + tile - 1) / tile, rows = (height + tile - 1) / tile;
 
-            var blocks = new List<(int X, int Y, int W, int H, int Pitch, int Offset)>(cols * rows);
+            int parts = checked(cols * rows);
+            int tableBase = baseOffset;
+            int dataBase = checked(tableBase + parts * 4);
 
-            int dataOfs = baseOffset + cols * rows * 4;
+            int ofs = dataBase;
+            int[] blockOfs = new int[parts];
+            int[] blockPitch = new int[parts];
+            int[] blockW = new int[parts];
+            int[] blockH = new int[parts];
 
-            for (int iy = 0; iy < rows; iy++)
-            for (int ix = 0; ix < cols; ix++)
+            for (int iy = 0, i = 0; iy < rows; iy++)
+            for (int ix = 0; ix < cols; ix++, i++)
             {
-                int x = ix * tile, y = iy * tile;
-                int w = Math.Min(tile, width - x), h = Math.Min(tile, height - y);
-                if (w <= 0 || h <= 0) continue;
-
+                int bx = ix * tile, by = iy * tile;
+                int w = Math.Min(tile, width - bx), h = Math.Min(tile, height - by);
+                if (w <= 0 || h <= 0) { blockOfs[i] = ofs; blockPitch[i] = 0; blockW[i] = 0; blockH[i] = 0; continue; }
                 int pitch = Align4(checked(w * bpp));
-                blocks.Add((x, y, w, h, pitch, dataOfs));
-                dataOfs += 0x10 + pitch * h;
+                blockOfs[i] = ofs;
+                blockPitch[i] = pitch;
+                blockW[i] = w;
+                blockH[i] = h;
+                ofs = checked(ofs + 0x10 + pitch * h);
             }
 
-            byte[] result = new byte[dataOfs];
-            Array.Copy(header, 0, result, 0, 0x2C);
+            byte[] result = new byte[ofs];
+            Buffer.BlockCopy(header, 0, result, 0, 0x2C);
 
             BeBinary.WriteInt32(result, 0x14, width, true);
             BeBinary.WriteInt32(result, 0x18, height, true);
-            BeBinary.WriteInt32(result, 0x1C, blocks.Count, true);
+            BeBinary.WriteInt32(result, 0x1C, parts, true);
 
-            for (int i = 0; i < blocks.Count; i++)
-                BeBinary.WriteInt32(result, baseOffset + i * 4, blocks[i].Offset, true);
+            for (int i = 0; i < parts; i++)
+                BeBinary.WriteInt32(result, tableBase + i * 4, blockOfs[i], true);
 
-            foreach (var b in blocks)
+            img.ProcessPixelRows(accessor =>
             {
-                BeBinary.WriteInt32(result, b.Offset + 0x00, b.X, true);
-                BeBinary.WriteInt32(result, b.Offset + 0x04, b.Y, true);
-                BeBinary.WriteInt32(result, b.Offset + 0x08, b.W, true);
-                BeBinary.WriteInt32(result, b.Offset + 0x0C, b.H, true);
-                EncodeBlockLegacyLe(img, result, b.X, b.Y, b.W, b.H, b.Offset + 0x10, b.Pitch, bpp, is1555);
-            }
-
-            return result;
-        }
-
-        static void DecodeBlockBe(byte[] data, string magic, int bpp, int dx, int dy, int w, int h, int start, Image<Rgba32> img)
-        {
-            int pitch = bpp == 4 ? w * 4 : ((w * 2) + 3) & ~3;
-            bool is1555 = magic is "1555" or "T1aD";
-
-            for (int y = 0; y < h; y++)
-            {
-                int sy = dy + y;
-                if ((uint)sy >= (uint)img.Height) continue;
-                int rowBase = start + y * pitch;
-
-                for (int x = 0; x < w; x++)
+                for (int iy = 0, i = 0; iy < rows; iy++)
+                for (int ix = 0; ix < cols; ix++, i++)
                 {
-                    int sx = dx + x;
-                    if ((uint)sx >= (uint)img.Width) continue;
+                    int w = blockW[i], h = blockH[i];
+                    if (w <= 0 || h <= 0) continue;
+
+                    int bx = ix * tile, by = iy * tile;
+                    int bo = blockOfs[i];
+                    int pitch = blockPitch[i];
+                    int start = bo + 0x10;
+
+                    BeBinary.WriteInt32(result, bo + 0x00, bx, true);
+                    BeBinary.WriteInt32(result, bo + 0x04, by, true);
+                    BeBinary.WriteInt32(result, bo + 0x08, w, true);
+                    BeBinary.WriteInt32(result, bo + 0x0C, h, true);
 
                     if (bpp == 4)
                     {
-                        int off = rowBase + x * 4;
-                        if (off + 3 >= data.Length) return;
-                        img[sx, sy] = new Rgba32(data[off + 1], data[off + 2], data[off + 3], data[off]);
+                        for (int y = 0; y < h; y++)
+                        {
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(start + y * pitch, w * 4);
+                            for (int x = 0, p = 0; x < w; x++, p += 4)
+                            {
+                                var px = srcRow[x];
+                                outRow[p + 0] = px.B;
+                                outRow[p + 1] = px.G;
+                                outRow[p + 2] = px.R;
+                                outRow[p + 3] = px.A;
+                            }
+                        }
+                    }
+                    else if (is1555)
+                    {
+                        for (int y = 0; y < h; y++)
+                        {
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(start + y * pitch, w * 2);
+                            for (int x = 0, p = 0; x < w; x++, p += 2)
+                            {
+                                var px = srcRow[x];
+                                ushort v = (ushort)(((px.A > 127 ? 1 : 0) << 15) | ((px.R >> 3) << 10) | ((px.G >> 3) << 5) | (px.B >> 3));
+                                outRow[p + 0] = (byte)v;
+                                outRow[p + 1] = (byte)(v >> 8);
+                            }
+                        }
                     }
                     else
                     {
-                        int off = rowBase + x * 2;
-                        if (off + 1 >= data.Length) return;
-                        ushort v = (ushort)((data[off] << 8) | data[off + 1]);
-                        img[sx, sy] = is1555
-                            ? new Rgba32((byte)(((v >> 10) & 0x1F) << 3), (byte)(((v >> 5) & 0x1F) << 3),
-                                (byte)((v & 0x1F) << 3), (byte)(((v >> 15) & 1) * 255))
-                            : new Rgba32((byte)(((v >> 8) & 0xF) * 17), (byte)(((v >> 4) & 0xF) * 17),
-                                (byte)((v & 0xF) * 17), (byte)(((v >> 12) & 0xF) * 17));
+                        for (int y = 0; y < h; y++)
+                        {
+                            ReadOnlySpan<Rgba32> srcRow = accessor.GetRowSpan(by + y).Slice(bx, w);
+                            Span<byte> outRow = result.AsSpan(start + y * pitch, w * 2);
+                            for (int x = 0, p = 0; x < w; x++, p += 2)
+                            {
+                                var px = srcRow[x];
+                                ushort v = (ushort)(((px.A >> 4) << 12) | ((px.R >> 4) << 8) | ((px.G >> 4) << 4) | (px.B >> 4));
+                                outRow[p + 0] = (byte)v;
+                                outRow[p + 1] = (byte)(v >> 8);
+                            }
+                        }
                     }
                 }
-            }
-        }
+            });
 
-        static void DecodeBlockLegacyLe(byte[] data, Image<Rgba32> img, int px, int py, int cw, int ch, int pitch, int start, int bpp, bool is1555)
-        {
-            if (bpp == 4)
-            {
-                for (int row = 0; row < ch; row++)
-                {
-                    int rowBase = start + row * pitch;
-                    for (int x = 0; x < cw; x++)
-                    {
-                        int p = rowBase + x * 4;
-                        byte b = data[p + 0], g = data[p + 1], r = data[p + 2], a = data[p + 3];
-                        img[px + x, py + row] = new Rgba32(r, g, b, a);
-                    }
-                }
-            }
-            else
-            {
-                for (int row = 0; row < ch; row++)
-                {
-                    int rowBase = start + row * pitch;
-                    for (int x = 0; x < cw; x++)
-                    {
-                        int p = rowBase + x * 2;
-                        ushort v = (ushort)(data[p] | (data[p + 1] << 8));
-                        img[px + x, py + row] = is1555
-                            ? new Rgba32((byte)(((v >> 10) & 0x1F) << 3), (byte)(((v >> 5) & 0x1F) << 3),
-                                (byte)((v & 0x1F) << 3), (byte)(((v >> 15) & 1) * 255))
-                            : new Rgba32((byte)(((v >> 8) & 0xF) * 17), (byte)(((v >> 4) & 0xF) * 17),
-                                (byte)((v & 0xF) * 17), (byte)(((v >> 12) & 0xF) * 17));
-                    }
-                }
-            }
-        }
-
-        static void EncodeBlockBe(Image<Rgba32> img, byte[] dst, int bx, int by, int w, int h, int start, int pitch, int bpp, bool is1555)
-        {
-            for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-            {
-                int sx = bx + x, sy = by + y;
-                if (sx >= img.Width || sy >= img.Height) continue;
-                var px = img[sx, sy];
-
-                if (bpp == 4)
-                {
-                    int off = start + y * pitch + x * 4;
-                    dst[off] = px.A; dst[off + 1] = px.R; dst[off + 2] = px.G; dst[off + 3] = px.B;
-                }
-                else
-                {
-                    ushort v = is1555
-                        ? (ushort)(((px.A > 127 ? 1 : 0) << 15) | ((px.R >> 3) << 10) | ((px.G >> 3) << 5) | (px.B >> 3))
-                        : (ushort)(((px.A >> 4) << 12) | ((px.R >> 4) << 8) | ((px.G >> 4) << 4) | (px.B >> 4));
-                    int off = start + y * pitch + x * 2;
-                    dst[off] = (byte)(v >> 8); dst[off + 1] = (byte)v;
-                }
-            }
-        }
-
-        static void EncodeBlockLegacyLe(Image<Rgba32> img, byte[] dst, int bx, int by, int w, int h, int start, int pitch, int bpp, bool is1555)
-        {
-            for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-            {
-                int sx = bx + x, sy = by + y;
-                if (sx >= img.Width || sy >= img.Height) continue;
-                var px = img[sx, sy];
-
-                if (bpp == 4)
-                {
-                    int off = start + y * pitch + x * 4;
-                    dst[off + 0] = px.B;
-                    dst[off + 1] = px.G;
-                    dst[off + 2] = px.R;
-                    dst[off + 3] = px.A;
-                }
-                else
-                {
-                    ushort v = is1555
-                        ? (ushort)(((px.A > 127 ? 1 : 0) << 15) | ((px.R >> 3) << 10) | ((px.G >> 3) << 5) | (px.B >> 3))
-                        : (ushort)(((px.A >> 4) << 12) | ((px.R >> 4) << 8) | ((px.G >> 4) << 4) | (px.B >> 4));
-                    int off = start + y * pitch + x * 2;
-                    dst[off + 0] = (byte)v;
-                    dst[off + 1] = (byte)(v >> 8);
-                }
-            }
+            return result;
         }
 
         static void ValidateSize(string magic, int w, int h, int parts, int len)
