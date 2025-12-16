@@ -236,8 +236,8 @@ namespace IpfbTool.Archive
 
             bw.Write("IPFB"u8);
             BeBinary.WriteInt32(bw, entries.Count);
-            BeBinary.WriteInt32(bw, 0x800);
-            BeBinary.WriteInt32(bw, 0x10000000);
+            BeBinary.WriteInt32(bw, 0x800);  // size_padding
+            BeBinary.WriteInt32(bw, 0x10000000); // lim_container
 
             foreach (var e in entries)
             {
